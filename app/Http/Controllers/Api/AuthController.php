@@ -71,22 +71,27 @@ class AuthController extends Controller
         return response()->json($request->user());
     }
 
-    public function redirectToGoogle()
-    {
-        try {
-            // 🔧 PRODUCTION: Remove this SSL bypass
-            $socialite = Socialite::driver('google')->stateless();
-
-            if (config('app.env') === 'local') {
-                $socialite->setHttpClient(new \GuzzleHttp\Client(['verify' => false]));
-            }
-
-            return $socialite->redirect();
-        } catch (\Exception $e) {
-            // 🔧 PRODUCTION: Change frontend URL
-            return redirect('http://localhost:5173/login?error=google_auth_failed&message=' . urlencode($e->getMessage()));
+ public function redirectToGoogle(Request $request)
+{
+    try {
+        // ✅ START SESSION FIRST - This is the fix!
+        if (!$request->session()->has('_token')) {
+            $request->session()->put('_token', csrf_token());
+            $request->session()->save();
         }
+
+        // SSL bypass for local dev
+        $socialite = Socialite::driver('google')->stateless();
+
+        if (config('app.env') === 'local') {
+            $socialite->setHttpClient(new \GuzzleHttp\Client(['verify' => false]));
+        }
+
+        return $socialite->redirect();
+    } catch (\Exception $e) {
+        return redirect('http://localhost:5173/login?error=google_auth_failed&message=' . urlencode($e->getMessage()));
     }
+}
 
     public function handleGoogleCallback(Request $request)
     {

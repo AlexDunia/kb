@@ -26,8 +26,11 @@ Route::post('/logout', [AuthController::class, 'logout'])->middleware('auth:sanc
 Route::get('/user', [AuthController::class, 'user'])->middleware('auth:sanctum');
 
 // ✅ NEW: Google OAuth routes
-Route::get('/auth/google', [AuthController::class, 'redirectToGoogle']);
-Route::get('/auth/google/callback', [AuthController::class, 'handleGoogleCallback']);
+// Google OAuth routes with session middleware
+Route::middleware(['web'])->group(function () {
+    Route::get('/auth/google', [AuthController::class, 'redirectToGoogle']);
+    Route::get('/auth/google/callback', [AuthController::class, 'handleGoogleCallback']);
+});
 
 // Event routes
 Route::get('/events', [EventController::class, 'index'])->name('events.index');
