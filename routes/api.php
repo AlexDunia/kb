@@ -58,3 +58,22 @@ Route::get('/cors-test', function(Request $request) {
         'time' => now()->toDateTimeString(),
     ]);
 })->name('cors.test');
+
+
+use App\Http\Controllers\Api\RecommendationController;
+
+// Recommendation routes (authenticated users only)
+Route::middleware(['auth:sanctum'])->group(function () {
+    Route::get('/recommendations', [RecommendationController::class, 'index']);
+    Route::post('/recommendations/clear-cache', [RecommendationController::class, 'clearCache']);
+});
+
+// Event tracking routes
+Route::middleware(['throttle:60,1'])->group(function () {
+    Route::post('/events/{event}/track-view', [EventController::class, 'trackView']);
+});
+
+Route::middleware(['auth:sanctum'])->group(function () {
+    Route::post('/events/{event}/toggle-like', [EventController::class, 'toggleLike']);
+    Route::get('/events/{event}/check-liked', [EventController::class, 'checkLiked']);
+});

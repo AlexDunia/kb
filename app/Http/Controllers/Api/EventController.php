@@ -371,4 +371,84 @@ class EventController extends Controller
             ], 500);
         }
     }
+
+    /**
+     * Track when a user views an event
+     */
+    public function trackView(Event $event)
+    {
+        try {
+            if (auth()->check()) {
+                \App\Models\EventView::trackView(
+                    auth()->id(),
+                    $event->id,
+                    request()->ip()
+                );
+            }
+
+            return response()->json(['success' => true], 200);
+        } catch (\Exception $e) {
+            \Log::warning('Failed to track event view', [
+                'event_id' => $event->id,
+                'user_id' => auth()->id(),
+                'error' => $e->getMessage()
+            ]);
+
+            return response()->json(['success' => false], 200);
+        }
+    }
+
+    /**
+     * Toggle like/favorite on an event
+     */
+    public function toggleLike(Event $event)
+    {
+        try {
+            if (!auth()->check()) {
+                return response()->json([
+                    'error' => 'Unauthenticated',
+                    'message' => 'Please log in to like events'
+                ], 401);
+            }
+
+            $liked = \App\Models\EventLike::toggleLike(auth()->id(), $event->id);
+
+            if ($liked) {
+                $engine = new \App\Services\RecommendationEngine(auth()->user());
+                $engine->clearCache();
+            }
+
+            return response()->json([
+                'liked' => $liked,
+                'message' => $liked ? 'Event liked' : 'Event unliked'
+            ], 200);
+
+        } catch (\Exception $e) {
+            \Log::error('Failed to toggle event like', [
+                'event_id' => $event->id,
+                'user_id' => auth()->id(),
+                'error' => $e->getMessage()
+            ]);
+
+            return response()->json([
+                'error' => 'Failed to toggle like'
+            ], 500);
+        }
+    }
+
+    /**
+     * Check if user has liked an event
+     */
+    public function checkLiked(Event $event)
+    {
+        if (!auth()->check()) {
+            return response()->json(['liked' => false], 200);
+        }
+
+        $liked = \App\Models\EventLike::where('user_id', auth()->id())
+            ->where('event_id', $event->id)
+            ->exists();
+
+        return response()->json(['liked' => $liked], 200);
+    }
 }
