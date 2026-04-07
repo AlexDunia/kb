@@ -94,37 +94,43 @@ class AuthController extends Controller
 }
 
     public function handleGoogleCallback(Request $request)
-    {
-        try {
-            // 🔧 PRODUCTION: Remove this SSL bypass
-            $socialite = Socialite::driver('google')->stateless();
+{
+    try {
+        $socialite = Socialite::driver('google')->stateless();
 
-            if (config('app.env') === 'local') {
-                $socialite->setHttpClient(new \GuzzleHttp\Client(['verify' => false]));
-            }
-
-            $googleUser = $socialite->user();
-
-            $user = User::updateOrCreate(
-                ['email' => $googleUser->email],
-                [
-                    'name' => $googleUser->name ?? 'Google User',
-                    'google_id' => $googleUser->id,
-                    'avatar' => $googleUser->avatar,
-                    'password' => Hash::make(Str::random(24)),
-                    'email_verified_at' => now(),
-                ]
-            );
-
-            Auth::login($user);
-            $request->session()->regenerate();
-
-            // 🔧 PRODUCTION: Change this redirect URL
-            return redirect('http://localhost:5173/dashboard');
-
-        } catch (\Exception $e) {
-            // 🔧 PRODUCTION: Change frontend URL
-            return redirect('http://localhost:5173/login?error=google_auth_failed&message=' . urlencode($e->getMessage()));
+        if (config('app.env') === 'local') {
+            $socialite->setHttpClient(new \GuzzleHttp\Client(['verify' => false]));
         }
+
+        $googleUser = $socialite->user();
+
+        $user = User::updateOrCreate(
+            ['email' => $googleUser->email],
+            [
+                'name' => $googleUser->name ?? 'Google User',
+                'google_id' => $googleUser->id,
+                'avatar' => $googleUser->avatar,
+                'password' => Hash::make(Str::random(24)),
+                'email_verified_at' => now(),
+            ]
+        );
+
+        Auth::login($user);
+        $request->session()->regenerate();
+
+        // ✅ Send user data to your Vue callback component
+        $userData = urlencode(json_encode([
+            'id' => $user->id,
+            'name' => $user->name,
+            'email' => $user->email,
+            'role' => $user->role,
+            'avatar' => $user->avatar,
+        ]));
+
+        return redirect('http://localhost:5173/auth/google/success?user=' . $userData);
+
+    } catch (\Exception $e) {
+        return redirect('http://localhost:5173/login?error=google_auth_failed&message=' . urlencode($e->getMessage()));
     }
+}
 }
