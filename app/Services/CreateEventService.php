@@ -16,7 +16,11 @@ class CreateEventService
 {
     public function resolveCategory(string $name): ?int
     {
-        return Category::whereRaw('LOWER(name) = ?', [strtolower(trim($name))])->value('id');
+        \Log::info('resolveCategory input: '.json_encode($name));
+        $result = Category::whereRaw('LOWER(name) = ?', [strtolower(trim($name))])->value('id');
+        \Log::info('resolveCategory result: '.json_encode($result));
+
+        return $result;
     }
 
     public function resolveOrganizer(string $name): int
@@ -24,7 +28,7 @@ class CreateEventService
         $id = Organizer::whereRaw('LOWER(name) = ?', [strtolower(trim($name))])->value('id');
         return $id !== null
             ? (int) $id
-            : Organizer::create(['name' => $name, 'email' => ''])->id;
+            : Organizer::create(['name' => $name, 'email' => null])->id;
     }
 
     public function resolveAddress(string $venue): int

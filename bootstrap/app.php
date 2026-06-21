@@ -12,11 +12,6 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware) {
-        $middleware->prepend(\App\Http\Middleware\Cors::class);
-        $middleware->alias([
-            'cors' => \App\Http\Middleware\Cors::class,
-        ]);
-        
         // Configure Sanctum for SPA authentication
         $middleware->group('api', [
             EnsureFrontendRequestsAreStateful::class,
