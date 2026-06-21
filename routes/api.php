@@ -41,7 +41,7 @@ Route::delete('/events/{event}', [EventController::class, 'destroy'])->middlewar
 
 // Category routes
 Route::get('/categories', [CategoryController::class, 'index'])->name('categories.index');
-
+Route::get('/user/liked-events', [EventController::class, 'getLikedEvents']);
 // SubCategory routes
 Route::get('/subcategories', [SubCategoryController::class, 'index'])->name('subcategories.index');
 

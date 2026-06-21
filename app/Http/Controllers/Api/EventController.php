@@ -418,10 +418,11 @@ class EventController extends Controller
                 $engine->clearCache();
             }
 
-            return response()->json([
-                'liked' => $liked,
-                'message' => $liked ? 'Event liked' : 'Event unliked'
-            ], 200);
+         return response()->json([
+    'liked' => $liked,
+    'likes_count' => \App\Models\EventLike::where('event_id', $event->id)->count(),
+    'message' => $liked ? 'Event liked' : 'Event unliked'
+], 200);
 
         } catch (\Exception $e) {
             \Log::error('Failed to toggle event like', [
@@ -439,16 +440,37 @@ class EventController extends Controller
     /**
      * Check if user has liked an event
      */
-    public function checkLiked(Event $event)
-    {
-        if (!auth()->check()) {
-            return response()->json(['liked' => false], 200);
-        }
-
-        $liked = \App\Models\EventLike::where('user_id', auth()->id())
-            ->where('event_id', $event->id)
-            ->exists();
-
-        return response()->json(['liked' => $liked], 200);
+   public function checkLiked(Event $event)
+{
+    if (!auth()->check()) {
+        return response()->json(['liked' => false, 'likes_count' => 0], 200);
     }
+
+    $liked = \App\Models\EventLike::where('user_id', auth()->id())
+        ->where('event_id', $event->id)
+        ->exists();
+
+    $count = \App\Models\EventLike::where('event_id', $event->id)->count();
+
+    return response()->json(['liked' => $liked, 'likes_count' => $count], 200);
+}
+
+
+
+    public function getLikedEvents(Request $request)
+{
+    $user = $request->user();
+
+    $likedEventIds = \App\Models\EventLike::where('user_id', $user->id)
+        ->pluck('event_id');
+
+    $events = Event::whereIn('id', $likedEventIds)
+        ->with(['category', 'address', 'ticketTypes'])
+        ->latest()
+        ->get();
+
+    return response()->json(['data' => $events]);
+}
+
+
 }
