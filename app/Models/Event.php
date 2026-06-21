@@ -93,6 +93,11 @@ class Event extends Model
         return $this->hasMany(Faq::class);
     }
 
+    public function media(): HasMany
+    {
+        return $this->hasMany(EventMedia::class);
+    }
+
     /**
      * The subcategories that belong to the event.
      */

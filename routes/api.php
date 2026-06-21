@@ -6,6 +6,7 @@ use App\Http\Controllers\Api\EventController;
 use App\Http\Controllers\Api\CategoryController;
 use App\Http\Controllers\Api\SubCategoryController;
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\CreateEventController;
 
 /*
 |--------------------------------------------------------------------------
@@ -77,3 +78,9 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::post('/events/{event}/toggle-like', [EventController::class, 'toggleLike']);
     Route::get('/events/{event}/check-liked', [EventController::class, 'checkLiked']);
 });
+
+// Create Event - open for testing (no auth middleware)
+// TODO: wrap in auth:sanctum middleware group when ready
+Route::post('/create-event', [CreateEventController::class, 'store']);
+Route::patch('/create-event/{id}', [CreateEventController::class, 'update']);
+Route::post('/create-event/{id}/publish', [CreateEventController::class, 'publish']);
