@@ -6,6 +6,7 @@ use App\Http\Controllers\Api\EventController;
 use App\Http\Controllers\Api\CategoryController;
 use App\Http\Controllers\Api\SubCategoryController;
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\PasswordResetController;
 use App\Http\Controllers\Api\CreateEventController;
 
 /*
@@ -25,6 +26,16 @@ Route::post('/login', [AuthController::class, 'login']);
 Route::post('/register', [AuthController::class, 'register']);
 Route::post('/logout', [AuthController::class, 'logout'])->middleware('auth:sanctum');
 Route::get('/user', [AuthController::class, 'user'])->middleware('auth:sanctum');
+
+Route::post(
+    '/forgot-password',
+    [PasswordResetController::class, 'sendResetLink']
+)->middleware('throttle:5,1');
+
+Route::post(
+    '/reset-password',
+    [PasswordResetController::class, 'reset']
+)->middleware('throttle:10,1');
 
 // ✅ NEW: Google OAuth routes
 // Google OAuth routes with session middleware
@@ -79,8 +90,24 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::get('/events/{event}/check-liked', [EventController::class, 'checkLiked']);
 });
 
-// Create Event - open for testing (no auth middleware)
-// TODO: wrap in auth:sanctum middleware group when ready
-Route::post('/create-event', [CreateEventController::class, 'store']);
-Route::patch('/create-event/{id}', [CreateEventController::class, 'update']);
-Route::post('/create-event/{id}/publish', [CreateEventController::class, 'publish']);
+Route::middleware(['auth:sanctum'])->group(function () {
+    Route::post(
+        '/create-event',
+        [CreateEventController::class, 'store']
+    );
+
+    Route::get(
+        '/create-event/{id}',
+        [CreateEventController::class, 'showForEditing']
+    );
+
+    Route::patch(
+        '/create-event/{id}',
+        [CreateEventController::class, 'update']
+    );
+
+    Route::post(
+        '/create-event/{id}/publish',
+        [CreateEventController::class, 'publish']
+    );
+});

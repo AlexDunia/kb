@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\Event;
+use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
@@ -14,8 +15,9 @@ class CreateEventTest extends TestCase
     public function test_a_draft_can_be_saved_updated_and_published(): void
     {
         DB::table('categories')->insert(['name' => 'Music']);
+        $user = User::factory()->create();
 
-        $created = $this->postJson('/api/create-event', [
+        $created = $this->actingAs($user)->postJson('/api/create-event', [
             'title' => 'Test',
             'category' => 'Music',
             'eventType' => 'one_time',
@@ -30,25 +32,23 @@ class CreateEventTest extends TestCase
             'format' => 'in-person',
             'startsAtLocal' => '2026-08-01T18:00:00',
             'timeZone' => 'Africa/Lagos',
-        ])->assertOk()
-            ->assertJsonPath('data.title', 'Test');
+        ])->assertOk()->assertJsonPath('data.title', 'Test');
 
         $this->postJson("/api/create-event/{$id}/publish")
-            ->assertUnprocessable()
-            ->assertJsonPath('errors.coverImage', 'A cover image is required');
+            ->assertUnprocessable()->assertJsonPath('errors.coverImage', 'A cover image is required');
 
         $this->patchJson("/api/create-event/{$id}", [
             'coverImage' => 'https://picsum.photos/800/450',
         ])->assertOk();
 
         $this->postJson("/api/create-event/{$id}/publish")
-            ->assertOk()
-            ->assertJsonPath('data.status', 'active');
+            ->assertOk()->assertJsonPath('data.status', 'active');
     }
 
     public function test_recurring_data_is_stored_without_transformation(): void
     {
         DB::table('categories')->insert(['name' => 'Music']);
+        $user = User::factory()->create();
         $recurrence = [
             'frequency' => 'weekly',
             'weeklyDays' => [0, 3, 6],
@@ -59,7 +59,7 @@ class CreateEventTest extends TestCase
             'occurrenceCount' => null,
         ];
 
-        $response = $this->postJson('/api/create-event', [
+        $response = $this->actingAs($user)->postJson('/api/create-event', [
             'title' => 'Weekly music',
             'category' => 'Music',
             'eventType' => 'recurring',

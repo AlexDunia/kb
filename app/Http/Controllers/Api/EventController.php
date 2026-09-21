@@ -112,7 +112,9 @@ class EventController extends Controller
             'organizer',
             'address',
             'subCategories',
-            'ticketTypes',
+            'ticketTypes' => function ($query) {
+                $query->where('visible', true);
+            },
             'faqs',
             'eventOptions'
         ]);

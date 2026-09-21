@@ -6,6 +6,7 @@ use App\Models\Category;
 use App\Models\Event;
 use App\Models\EventAddress;
 use App\Models\Organizer;
+use App\Models\Purchase;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -93,33 +94,167 @@ class CreateEventService
         ));
     }
 
-    public function syncTicketTypes(Event $event, array $payload): void
-    {
-        $event->ticketTypes()->delete();
-        if (($payload['ticketMode'] ?? 'free') !== 'paid' || empty($payload['tickets'])) {
-            return;
+    public function syncTicketTypes(
+        Event $event,
+        array $payload
+    ): void {
+        $incomingTickets =
+            ($payload['ticketMode'] ?? 'free') === 'paid'
+                ? ($payload['tickets'] ?? [])
+                : [];
+
+        $existingTickets =
+            $event
+                ->ticketTypes()
+                ->get()
+                ->keyBy('id');
+
+        $keptIds = [];
+
+        $timezone =
+            $payload['timeZone'] ??
+            'Africa/Lagos';
+
+        foreach ($incomingTickets as $ticket) {
+            $incomingId =
+                isset($ticket['id'])
+                    ? (int) $ticket['id']
+                    : null;
+
+            $ticketType =
+                $incomingId &&
+                $existingTickets->has($incomingId)
+                    ? $existingTickets->get($incomingId)
+                    : $event->ticketTypes()->make();
+
+            $ticketType
+                ->forceFill([
+                    'name' =>
+                        $this->strip(
+                            $ticket['name'] ?? ''
+                        ),
+
+                    'unit_type' =>
+                        in_array(
+                            $ticket['unitType'] ?? null,
+                            ['individual', 'table'],
+                            true
+                        )
+                            ? $ticket['unitType']
+                            : 'individual',
+
+                    'color' =>
+                        $this->strip(
+                            $ticket['color'] ??
+                            '#ec4899'
+                        ),
+
+                    'price' =>
+                        (float) (
+                            $ticket['price'] ?? 0
+                        ),
+
+                    'quantity' =>
+                        (int) (
+                            $ticket['units'] ?? 0
+                        ),
+
+                    'people_per_unit' =>
+                        max(
+                            1,
+                            (int) (
+                                $ticket['peoplePerUnit'] ?? 1
+                            )
+                        ),
+
+                    'max_per_person' =>
+                        ! empty(
+                            $ticket['maxPerPerson']
+                        )
+                            ? max(
+                                1,
+                                (int) $ticket[
+                                    'maxPerPerson'
+                                ]
+                            )
+                            : null,
+
+                    'visible' =>
+                        array_key_exists(
+                            'visible',
+                            $ticket
+                        )
+                            ? (bool) $ticket['visible']
+                            : true,
+
+                    'description' =>
+                        $this->strip(
+                            $ticket['perks'] ?? ''
+                        ),
+
+                    'sales_start_date' =>
+                        $this->parseDateTime(
+                            $ticket[
+                                'salesStartLocal'
+                            ] ?? null,
+                            $ticket[
+                                'salesStart'
+                            ] ?? null,
+                            $timezone,
+                        ),
+
+                    'sales_end_date' =>
+                        $this->parseDateTime(
+                            $ticket[
+                                'salesEndLocal'
+                            ] ?? null,
+                            $ticket[
+                                'salesEnd'
+                            ] ?? null,
+                            $timezone,
+                        ),
+
+                    'is_featured' => false,
+                ])
+                ->save();
+
+            $keptIds[] =
+                $ticketType->id;
         }
 
-        $timezone = $payload['timeZone'] ?? 'Africa/Lagos';
-        foreach ($payload['tickets'] as $ticket) {
-            $ticketType = $event->ticketTypes()->make();
-            $ticketType->forceFill([
-                'name' => $this->strip($ticket['name'] ?? ''),
-                'price' => (float) ($ticket['price'] ?? 0),
-                'quantity' => (int) ($ticket['units'] ?? 0),
-                'description' => $this->strip($ticket['perks'] ?? ''),
-                'sales_start_date' => $this->parseDateTime(
-                    $ticket['salesStartLocal'] ?? null,
-                    $ticket['salesStart'] ?? null,
-                    $timezone,
-                ),
-                'sales_end_date' => $this->parseDateTime(
-                    $ticket['salesEndLocal'] ?? null,
-                    $ticket['salesEnd'] ?? null,
-                    $timezone,
-                ),
-                'is_featured' => false,
-            ])->save();
+        $removedTickets =
+            $event
+                ->ticketTypes()
+                ->when(
+                    $keptIds !== [],
+                    fn ($query) =>
+                        $query->whereNotIn(
+                            'id',
+                            $keptIds
+                        )
+                )
+                ->get();
+
+        foreach ($removedTickets as $removedTicket) {
+            $hasPurchaseHistory =
+                Purchase::query()
+                    ->where(
+                        'ticket_type_id',
+                        $removedTicket->id
+                    )
+                    ->exists();
+
+            if ($hasPurchaseHistory) {
+                $removedTicket
+                    ->forceFill([
+                        'visible' => false,
+                    ])
+                    ->save();
+
+                continue;
+            }
+
+            $removedTicket->delete();
         }
     }
 
@@ -135,6 +270,24 @@ class CreateEventService
     public function saveEvent(array $payload, ?int $userId, ?int $existingEventId = null): Event
     {
         return DB::transaction(function () use ($payload, $userId, $existingEventId): Event {
+            $event =
+                $existingEventId !== null
+                    ? Event::findOrFail($existingEventId)
+                    : new Event();
+
+            if (
+                $event->exists &&
+                ! in_array(
+                    $event->status,
+                    ['draft', 'active'],
+                    true
+                )
+            ) {
+                throw ValidationException::withMessages([
+                    'event' =>
+                        'This event cannot be edited in its current state.',
+                ]);
+            }
             $categoryId = $this->resolveCategory($payload['category'] ?? '');
             $organizerId = $this->resolveOrganizer($this->strip($payload['organiser'] ?? 'Unknown Organiser'));
             $addressId = $this->resolveAddress($this->strip($payload['venue'] ?? ''));
@@ -161,8 +314,15 @@ class CreateEventService
                 'main_image' => $mainImage ?: null,
                 'banner_image' => null,
                 'banner_url' => $bannerUrl ?: null,
-                'created_by' => $userId,
-                'status' => 'draft',
+                'created_by' =>
+                    $event->exists
+                        ? $event->created_by
+                        : $userId,
+
+                'status' =>
+                    $event->exists
+                        ? $event->status
+                        : 'draft',
                 'event_format' => $payload['format'] ?? 'in-person',
                 'meeting_link' => $this->strip($payload['meetingLink'] ?? ''),
                 'organiser_website' => $this->strip($payload['organiserWebsite'] ?? ''),
@@ -173,14 +333,6 @@ class CreateEventService
                 'recurrence_data' => json_encode($this->buildRecurrenceData($payload)),
             ];
 
-            if ($existingEventId !== null) {
-                $event = Event::findOrFail($existingEventId);
-                if ($event->status !== 'draft') {
-                    throw ValidationException::withMessages(['event' => 'Cannot update a published event']);
-                }
-            } else {
-                $event = new Event();
-            }
 
             // The existing model's fillable list is intentionally left untouched.
             $event->forceFill($eventData)->save();
