@@ -1,0 +1,2 @@
+<?php
+namespace App\Models;use Illuminate\Database\Eloquent\Model;use Illuminate\Database\Eloquent\Relations\BelongsTo;class PayoutAccount extends Model {const STATUS_PENDING='pending',STATUS_ACTIVE='active',STATUS_DISABLED='disabled';protected $fillable=['user_id','provider','provider_subaccount_code','status','account_name','bank_name','account_last4'];public function user():BelongsTo{return $this->belongsTo(User::class);}}

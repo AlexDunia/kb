@@ -6,6 +6,7 @@ use App\Models\Category;
 use App\Models\Event;
 use App\Models\EventAddress;
 use App\Models\Organizer;
+use App\Models\OrderItem;
 use App\Models\Purchase;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -238,6 +239,13 @@ class CreateEventService
         foreach ($removedTickets as $removedTicket) {
             $hasPurchaseHistory =
                 Purchase::query()
+                    ->where(
+                        'ticket_type_id',
+                        $removedTicket->id
+                    )
+                    ->exists()
+                ||
+                OrderItem::query()
                     ->where(
                         'ticket_type_id',
                         $removedTicket->id

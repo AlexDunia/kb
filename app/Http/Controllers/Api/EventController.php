@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Event;
+use App\Models\OrderItem;
 use App\Models\Organizer;
 use App\Models\EventAddress;
 use App\Models\TicketType;
@@ -72,7 +73,7 @@ class EventController extends Controller
     // Pagination - FIX: Don't let page parameter break the query
     $perPage = min($request->input('per_page', 10), 100); // Max 100 items
 
-    // ✅ ADD DEBUG LOG
+    // âœ… ADD DEBUG LOG
     \Log::info('Events query', [
         'total_count' => Event::count(),
         'query_count' => $query->count(),
@@ -346,6 +347,20 @@ class EventController extends Controller
         // Check authorization
         if (!auth()->user()->hasAnyRole(['admin']) && auth()->id() !== $event->created_by) {
             return response()->json(['error' => 'Unauthorized'], 403);
+        }
+
+        if (
+            OrderItem::query()
+                ->where('event_id', $event->id)
+                ->exists()
+        ) {
+            return response()->json(
+                [
+                    'message' =>
+                        'Events with checkout history cannot be deleted. Hide or cancel the event instead.',
+                ],
+                422
+            );
         }
 
         try {
