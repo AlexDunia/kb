@@ -122,7 +122,7 @@ class CommercePaymentLifecycleTest extends TestCase
         $owner = User::factory()->create();
         [, $ticketTypeId] = $this->paidEvent($owner);
 
-        $transactionLevel = null;
+        $baselineTransactionLevel = DB::transactionLevel();`r`n        $transactionLevel = null;
 
         Http::fake(function (HttpRequest $request) use (&$transactionLevel) {
             $transactionLevel = DB::transactionLevel();
@@ -159,7 +159,7 @@ class CommercePaymentLifecycleTest extends TestCase
             $payload
         )->assertCreated();
 
-        $this->assertSame(0, $transactionLevel);
+        $this->assertSame($baselineTransactionLevel, $transactionLevel);
         $this->assertSame(
             $first->json('data.order.public_id'),
             $second->json('data.order.public_id')
@@ -234,21 +234,23 @@ class CommercePaymentLifecycleTest extends TestCase
 
         $token = (string) Str::uuid();
 
-        $result = $this->actingAs($buyer)
-            ->postJson(
-                '/api/checkout/initialize',
-                $this->checkoutPayload($ticketTypeId, $token)
-            )
-            ->assertCreated();
+        Sanctum::actingAs($buyer);
+
+        $result = $this->postJson(
+            '/api/checkout/initialize',
+            $this->checkoutPayload($ticketTypeId, $token)
+        )->assertCreated();
 
         $publicId = $result->json('data.order.public_id');
 
-        $this->actingAs($buyer)
-            ->getJson("/api/checkout/orders/{$publicId}")
+        Sanctum::actingAs($buyer);
+
+        $this->getJson("/api/checkout/orders/{$publicId}")
             ->assertOk();
 
-        $this->actingAs($other)
-            ->getJson("/api/checkout/orders/{$publicId}")
+        Sanctum::actingAs($other);
+
+        $this->getJson("/api/checkout/orders/{$publicId}")
             ->assertForbidden();
     }
 
