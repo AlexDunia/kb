@@ -12,18 +12,114 @@ use Illuminate\Support\Str;
 
 class AppServiceProvider extends ServiceProvider
 {
-    public function register(): void {}
+    public function register(): void
+    {
+        //
+    }
+
     public function boot(): void
     {
-        if (config('app.env') === 'production') { URL::forceScheme('https'); }
-        ResetPassword::createUrlUsing(function (object $notifiable, string $token): string {
-            $frontendUrl = rtrim((string) config('app.frontend_url'), '/');
-            return $frontendUrl . '/reset-password?' . http_build_query(['token' => $token, 'email' => $notifiable->getEmailForPasswordReset()]);
-        });
-        RateLimiter::for('api', fn (Request $request) => Limit::perMinute(60)->by($request->user()?->id ?? $request->ip()));
-        RateLimiter::for('checkout-quote', fn (Request $request) => Limit::perMinute(60)->by($request->ip()));
-        RateLimiter::for('checkout-initialize', function (Request $request) { $email=Str::lower((string) $request->input('customer.email','unknown')); return [Limit::perMinute(15)->by($request->ip()), Limit::perMinute(8)->by($email.'|'.$request->ip())]; });
-        RateLimiter::for('checkout-verify', fn (Request $request) => Limit::perMinute(30)->by($request->ip()));
-        RateLimiter::for('paystack-webhook', fn (Request $request) => Limit::perMinute(600)->by($request->ip()));
+        if (config('app.env') === 'production') {
+            URL::forceScheme('https');
+        }
+
+        ResetPassword::createUrlUsing(
+            function (object $notifiable, string $token): string {
+                $frontendUrl = rtrim(
+                    (string) config('app.frontend_url'),
+                    '/'
+                );
+
+                return $frontendUrl
+                    . '/reset-password?'
+                    . http_build_query([
+                        'token' => $token,
+                        'email' =>
+                            $notifiable->getEmailForPasswordReset(),
+                    ]);
+            }
+        );
+
+        RateLimiter::for(
+            'api',
+            fn (Request $request) =>
+                Limit::perMinute(60)->by(
+                    $request->user()?->id
+                    ?? $request->ip()
+                )
+        );
+
+        RateLimiter::for(
+            'checkout-quote',
+            fn (Request $request) =>
+                Limit::perMinute(60)->by(
+                    $request->ip()
+                )
+        );
+
+        RateLimiter::for(
+            'checkout-initialize',
+            function (Request $request) {
+                $email = Str::lower(
+                    (string) $request->input(
+                        'customer.email',
+                        'unknown'
+                    )
+                );
+
+                return [
+                    Limit::perMinute(15)->by(
+                        $request->ip()
+                    ),
+                    Limit::perMinute(8)->by(
+                        $email . '|' . $request->ip()
+                    ),
+                ];
+            }
+        );
+
+        RateLimiter::for(
+            'checkout-verify',
+            fn (Request $request) =>
+                Limit::perMinute(30)->by(
+                    $request->ip()
+                )
+        );
+
+        RateLimiter::for(
+            'paystack-webhook',
+            fn (Request $request) =>
+                Limit::perMinute(600)->by(
+                    $request->ip()
+                )
+        );
+
+        // Public, low-impact analytics write. It is deliberately IP-limited
+        // and also deduplicated server-side by event + visitor + hour.
+        RateLimiter::for(
+            'event-view',
+            fn (Request $request) =>
+                Limit::perMinute(120)->by(
+                    $request->ip()
+                )
+        );
+
+        RateLimiter::for(
+            'dashboard-read',
+            fn (Request $request) =>
+                Limit::perMinute(120)->by(
+                    $request->user()?->id
+                    ?? $request->ip()
+                )
+        );
+
+        RateLimiter::for(
+            'dashboard-write',
+            fn (Request $request) =>
+                Limit::perMinute(20)->by(
+                    $request->user()?->id
+                    ?? $request->ip()
+                )
+        );
     }
 }

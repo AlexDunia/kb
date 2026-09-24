@@ -12,12 +12,22 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware) {
-        // Configure Sanctum for SPA authentication
         $middleware->group('api', [
             EnsureFrontendRequestsAreStateful::class,
             'throttle:api',
             \Illuminate\Routing\Middleware\SubstituteBindings::class,
         ]);
+
+        // Event-view tracking is intentionally public and writes no privileged
+        // user state. Keeping it outside CSRF avoids an extra cookie round-trip
+        // for every anonymous event visitor. Abuse is constrained by the
+        // event-view limiter plus hourly server-side deduplication.
+        $middleware->validateCsrfTokens(
+            except: [
+                'api/events/*/track-view',
+                'api/payments/paystack/webhook',
+            ]
+        );
     })
     ->withExceptions(function (Exceptions $exceptions) {
         //
