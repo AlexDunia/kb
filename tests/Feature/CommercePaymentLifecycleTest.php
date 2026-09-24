@@ -18,9 +18,13 @@ class CommercePaymentLifecycleTest extends TestCase
 
     private string $secret = 'sk_test_kakatickets';
 
+    private array $verifyStubs = [];
+
     protected function setUp(): void
     {
         parent::setUp();
+
+        $this->verifyStubs = [];
 
         config([
             'services.paystack.secret_key' => $this->secret,
@@ -28,7 +32,7 @@ class CommercePaymentLifecycleTest extends TestCase
             'commerce.currency' => 'NGN',
             'commerce.reservation_minutes' => 20,
             'commerce.platform_fee_bps' => 0,
-            'commerce.paystack_splits_enabled' => false,
+            'commerce.dynamic_splits_enabled' => false,
         ]);
     }
 
@@ -122,7 +126,8 @@ class CommercePaymentLifecycleTest extends TestCase
         $owner = User::factory()->create();
         [, $ticketTypeId] = $this->paidEvent($owner);
 
-        $baselineTransactionLevel = DB::transactionLevel();`r`n        $transactionLevel = null;
+        $baselineTransactionLevel = DB::transactionLevel();
+$transactionLevel = null;
 
         Http::fake(function (HttpRequest $request) use (&$transactionLevel) {
             $transactionLevel = DB::transactionLevel();
@@ -981,10 +986,15 @@ class CommercePaymentLifecycleTest extends TestCase
     private function fakeInitialize(): void
     {
         Http::fake(function (HttpRequest $request) {
-            if (str_contains(
-                $request->url(),
-                '/transaction/initialize'
-            )) {
+            $url = $request->url();
+
+            if (
+                $request->method() === 'POST'
+                && str_contains(
+                    $url,
+                    '/transaction/initialize'
+                )
+            ) {
                 $reference = (string) $request['reference'];
 
                 return Http::response(
@@ -999,6 +1009,62 @@ class CommercePaymentLifecycleTest extends TestCase
                             'access_code' =>
                                 'access_' . $reference,
                             'reference' => $reference,
+                        ],
+                    ],
+                    200
+                );
+            }
+
+            if (
+                $request->method() === 'GET'
+                && str_contains(
+                    $url,
+                    '/transaction/verify/'
+                )
+            ) {
+                $path = (string) parse_url(
+                    $url,
+                    PHP_URL_PATH
+                );
+
+                $reference = rawurldecode(
+                    basename($path)
+                );
+
+                $stub = $this->verifyStubs[$reference]
+                    ?? null;
+
+                if ($stub === null) {
+                    return Http::response([], 404);
+                }
+
+                return Http::response(
+                    [
+                        'status' => true,
+                        'message' => 'Verification complete',
+                        'data' => [
+                            'id' =>
+                                'txn_'
+                                . substr(
+                                    hash(
+                                        'sha256',
+                                        $reference
+                                    ),
+                                    0,
+                                    16
+                                ),
+                            'status' => $stub['status'],
+                            'reference' => $reference,
+                            'amount' => $stub['amount_minor'],
+                            'currency' => $stub['currency'],
+                            'channel' => 'card',
+                            'gateway_response' =>
+                                ucfirst(
+                                    $stub['status']
+                                ),
+                            'paid_at' =>
+                                $stub['paid_at']
+                                ?? now()->toIso8601String(),
                         ],
                     ],
                     200
@@ -1031,29 +1097,12 @@ class CommercePaymentLifecycleTest extends TestCase
         ?string $paidAt = null,
         string $currency = 'NGN'
     ): void {
-        Http::fake([
-            'https://api.paystack.co/transaction/verify/*' =>
-                Http::response(
-                    [
-                        'status' => true,
-                        'message' => 'Verification complete',
-                        'data' => [
-                            'id' => 'txn_' . substr(hash('sha256', $reference), 0, 16),
-                            'status' => $status,
-                            'reference' => $reference,
-                            'amount' => $amountMinor,
-                            'currency' => $currency,
-                            'channel' => 'card',
-                            'gateway_response' => ucfirst(
-                                $status
-                            ),
-                            'paid_at' => $paidAt
-                                ?? now()->toIso8601String(),
-                        ],
-                    ],
-                    200
-                ),
-        ]);
+        $this->verifyStubs[$reference] = [
+            'status' => $status,
+            'amount_minor' => $amountMinor,
+            'paid_at' => $paidAt,
+            'currency' => $currency,
+        ];
     }
 
     private function paidEvent(
