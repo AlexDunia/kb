@@ -45,6 +45,14 @@ class CreateEventController extends Controller
 
     private function summary(Event $event, CreateEventService $service): array
     {
-        return ['id' => $event->id, 'status' => $event->status, 'title' => $event->title, 'version' => (int) $event->lock_version, 'form' => $service->editorPayload($event)];
+        return [
+            'id' => $event->id,
+            'status' => $event->status,
+            'title' => $event->title,
+            'version' => (int) $event->lock_version,
+            'lifecycle_state' => $event->lifecycle_state,
+            'booking_cutoff_at' => $event->booking_cutoff_at?->toIso8601String(),
+            'form' => $service->editorPayload($event),
+        ];
     }
 }

@@ -11,7 +11,6 @@ use App\Http\Controllers\Api\PasswordResetController;
 use App\Http\Controllers\Api\PaystackWebhookController;
 use App\Http\Controllers\Api\RecommendationController;
 use App\Http\Controllers\Api\SubCategoryController;
-use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
 Route::get(
@@ -85,22 +84,6 @@ Route::get(
 
 Route::get('/subcategories', [SubCategoryController::class, 'index'])
     ->name('subcategories.index');
-
-Route::get('/ping', function () {
-    return response()->json([
-        'message' => 'pong',
-        'success' => true,
-    ]);
-})->name('ping');
-
-Route::get('/cors-test', function (Request $request) {
-    return response()->json([
-        'message' => 'CORS is working correctly!',
-        'origin' => $request->header('Origin'),
-        'method' => $request->method(),
-        'time' => now()->toDateTimeString(),
-    ]);
-})->name('cors.test');
 
 Route::middleware(['auth:sanctum'])->group(function () {
     Route::get(
