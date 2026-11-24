@@ -157,7 +157,7 @@ class EventEditorValidation
             'tickets.*.salesStart' => 'nullable|date', 'tickets.*.salesEnd' => 'nullable|date',
             'tickets.*.salesStartLocal' => 'nullable|date_format:Y-m-d\TH:i:s', 'tickets.*.salesEndLocal' => 'nullable|date_format:Y-m-d\TH:i:s',
             'attendeeFields' => 'nullable|array|max:30', 'attendeeFields.*' => 'array:id,label,enabled,required',
-            'attendeeFields.*.id' => 'required|string|max:50', 'attendeeFields.*.label' => 'required|string|max:200',
+            'attendeeFields.*.id' => 'required|string|max:50|distinct|regex:/^[a-zA-Z][a-zA-Z0-9_]*$/D', 'attendeeFields.*.label' => 'required|string|max:200',
             'attendeeFields.*.enabled' => 'required|boolean', 'attendeeFields.*.required' => 'required|boolean',
             'extraDetails' => 'nullable|array|max:8', 'extraDetails.*' => 'array:type,label,value',
             'extraDetails.*.type' => 'required|distinct|in:parking,dress,bring,agenda,speakers,food,transport,faq',

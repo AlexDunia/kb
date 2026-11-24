@@ -25,7 +25,7 @@ class CheckoutService
         private readonly EventAttributionService $attribution
     ) {}
 
-    public function quote(array $items): array
+    public function quote(array $items, ?array $discount = null): array
     {
         $items = $this->normalizedItems($items);
         $ids = array_column($items, 'ticket_type_id');
@@ -36,11 +36,11 @@ class CheckoutService
             ->get()
             ->keyBy('id');
 
-        return $this->buildQuote(
+        return app(DiscountService::class)->apply($this->buildQuote(
             $items,
             $types,
             $this->inventory->reservedQuantities($ids)
-        );
+        ), $discount);
     }
 
     public function initialize(
@@ -66,6 +66,8 @@ class CheckoutService
                 [
                     'customer' => $customer,
                     'items' => $items,
+                    ...(! empty($payload['discount']) ? ['discount' => ['event_id' => (int) $payload['discount']['event_id'], 'code' => strtoupper(trim($payload['discount']['code']))]] : []),
+                    ...(! empty($payload['attendees']) ? ['attendees' => $payload['attendees']] : []),
                 ],
                 JSON_THROW_ON_ERROR
             )
@@ -83,7 +85,8 @@ class CheckoutService
                 $items,
                 $userId,
                 $visitorId,
-                $visitorHash
+                $visitorHash,
+                $payload
             ) {
                 $existing = Order::query()
                     ->where('checkout_token_hash', $hash)
@@ -112,7 +115,8 @@ class CheckoutService
                         $items,
                         $userId,
                         $visitorId,
-                        $visitorHash
+                        $visitorHash,
+                        $payload
                     ) {
                         $ids = collect($items)
                             ->pluck('ticket_type_id')
@@ -133,6 +137,8 @@ class CheckoutService
                             $types,
                             $this->inventory->reservedQuantities($ids)
                         );
+
+                        $quote = app(DiscountService::class)->apply($quote, $payload['discount'] ?? null, true);
 
                         $eventIds = collect($quote['items'])
                             ->pluck('event_id')
@@ -161,7 +167,7 @@ class CheckoutService
                             'customer_phone' => $customer['phone'],
                             'currency' => $quote['currency'],
                             'subtotal_minor' => $quote['subtotal_minor'],
-                            'discount_minor' => 0,
+                            'discount_minor' => $quote['discount_minor'],
                             'total_minor' => $quote['total_minor'],
                             'status' => Order::STATUS_PENDING_PAYMENT,
                             'expires_at' => now()->addMinutes(
@@ -174,6 +180,8 @@ class CheckoutService
                                 )
                             ),
                         ]);
+
+                        app(DiscountService::class)->reserve($order, $quote);
 
                         foreach ($quote['items'] as $line) {
                             $eventId = (int) $line['event_id'];
@@ -188,11 +196,20 @@ class CheckoutService
                             ]);
                         }
 
+                        app(RegistrationService::class)->attach($order, $payload['attendees'] ?? []);
+
                         $this->createAllocations(
                             $order,
                             $quote['currency']
                         );
 
+                        if ($order->total_minor === 0) {
+                            $order->update(['status' => 'registered']);
+                            app(DiscountService::class)->redeem($order);
+                            $this->finalizer->issueTickets($order);
+
+                            return [$order, null];
+                        }
                         $payment = $this->createPayment($order);
 
                         return [$order, $payment];
@@ -202,6 +219,10 @@ class CheckoutService
 
                 // Intentionally outside the DB transaction. The application
                 // never holds inventory row locks while waiting on Paystack.
+                if (! $payment) {
+                    return $this->payload($order->fresh(), null);
+                }
+
                 return $this->initializePayment(
                     $order,
                     $payment
@@ -268,7 +289,7 @@ class CheckoutService
 
     public function publicOrderPayload(Order $order): array
     {
-        $order->loadMissing('items.tickets');
+        $order->loadMissing('items.tickets.attendees');
 
         return [
             'public_id' => $order->public_id,
@@ -276,6 +297,7 @@ class CheckoutService
             'currency' => $order->currency,
             'subtotal_minor' => (int) $order->subtotal_minor,
             'discount_minor' => (int) $order->discount_minor,
+            'refunded_minor' => (int) $order->items()->sum('refunded_minor'),
             'total_minor' => (int) $order->total_minor,
             'expires_at' => $order->expires_at?->toIso8601String(),
             'paid_at' => $order->paid_at?->toIso8601String(),
@@ -293,7 +315,11 @@ class CheckoutService
                         'unit_price_minor' => (int) $item->unit_price_minor,
                         'quantity' => (int) $item->quantity,
                         'line_total_minor' => (int) $item->line_total_minor,
-                        'tickets' => $order->isPaid()
+                        'discount_minor' => (int) $item->discount_minor,
+                        'refunded_minor' => (int) $item->refunded_minor,
+                        'refunded_quantity' => (int) $item->refunded_quantity,
+                        'registration_schema' => $item->registration_schema ?? [],
+                        'tickets' => $order->isFulfilled()
                             ? $item->tickets
                                 ->map(
                                     fn ($ticket) => [
@@ -301,6 +327,7 @@ class CheckoutService
                                         'token' => $ticket->token,
                                         'admit_count' => (int) $ticket->admit_count,
                                         'status' => $ticket->status,
+                                        'attendees' => $ticket->attendees->map(fn ($attendee) => $attendee->only(['id', 'name', 'email', 'seat_index', 'answers']))->values()->all(),
                                     ]
                                 )
                                 ->values()
@@ -337,18 +364,24 @@ class CheckoutService
             $locked = Order::whereKey($order->id)->lockForUpdate()->firstOrFail();
             $ids = array_column($items, 'ticket_type_id');
             $types = TicketType::whereIn('id', $ids)->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+            $offer = app(DiscountService::class)->lockForOrder($locked);
             $payment = $locked->payments()->latest('id')->lockForUpdate()->first();
-            if (in_array($locked->status, [Order::STATUS_PAID, Order::STATUS_PAYMENT_REVIEW, Order::STATUS_CANCELLED, Order::STATUS_REFUNDED], true)) {
+            if (in_array($locked->status, ['registered', 'partially_refunded', Order::STATUS_PAID, Order::STATUS_PAYMENT_REVIEW, Order::STATUS_CANCELLED, Order::STATUS_REFUNDED], true)) {
                 return [$locked, $payment, false];
             }
             if ($locked->expires_at?->lte(now())) {
                 $locked->update(['status' => Order::STATUS_EXPIRED]);
+                app(DiscountService::class)->release($locked);
 
                 return [$locked, $payment, true];
             }
             if ($locked->status === Order::STATUS_PAYMENT_FAILED) {
                 $types->load('event');
                 $this->buildQuote($items, $types, $this->inventory->reservedQuantities($ids, $locked->id));
+                if (! app(DiscountService::class)->canReacquire($locked, $offer, true)) {
+                    throw ValidationException::withMessages(['discount.code' => ['This discount can no longer be reserved. Start a new checkout.']]);
+                }
+                app(DiscountService::class)->reacquire($locked);
                 $locked->update(['status' => Order::STATUS_PENDING_PAYMENT]);
             }
             if (! $payment || $payment->status === Payment::STATUS_FAILED) {
@@ -439,7 +472,7 @@ class CheckoutService
                 ->select(
                     'seller_user_id',
                     DB::raw(
-                        'SUM(line_total_minor) AS gross_minor'
+                        'SUM(line_total_minor - discount_minor) AS gross_minor'
                     )
                 )
                 ->groupBy('seller_user_id')
@@ -450,6 +483,16 @@ class CheckoutService
                 $gross * $feeBps,
                 10000
             );
+
+            $remainingFee = $fee;
+            $remainingGross = $gross;
+            foreach ($order->items()->where('seller_user_id', $group->seller_user_id)->orderBy('id')->get() as $item) {
+                $net = $item->line_total_minor - $item->discount_minor;
+                $part = $remainingGross > 0 ? ($remainingGross === $net ? $remainingFee : Money::proportional($remainingFee, $net, $remainingGross)) : 0;
+                $item->update(['platform_fee_minor' => $part]);
+                $remainingFee -= $part;
+                $remainingGross -= $net;
+            }
 
             $payout = $group->seller_user_id
                 ? PayoutAccount::query()
@@ -467,6 +510,8 @@ class CheckoutService
                 'payout_account_id' => $payout?->id,
                 'provider_subaccount_code' => $payout?->provider_subaccount_code,
                 'gross_minor' => $gross,
+                'gross_before_discount_minor' => (int) $order->items()->where('seller_user_id', $group->seller_user_id)->sum('line_total_minor'),
+                'discount_minor' => (int) $order->items()->where('seller_user_id', $group->seller_user_id)->sum('discount_minor'),
                 'platform_fee_minor' => $fee,
                 'seller_net_minor' => max(
                     0,
@@ -496,8 +541,9 @@ class CheckoutService
             if (
                 ! $type
                 || ! $type->event
-                || $type->event->status !== 'active'
+                || ! $type->event->bookingsOpen()
                 || $type->event->ticket_mode !== 'paid'
+                || $type->event->event_type === 'recurring'
                 || ! $type->visible
                 || $type->retired_at !== null
                 || ($type->event->ends_at && $type->event->ends_at->lte(now()))
@@ -573,6 +619,10 @@ class CheckoutService
             $subtotal += $lineTotal;
         }
 
+        if (array_sum(array_map(fn ($line) => $line['quantity'] * $line['people_per_unit'], $lines)) > 500) {
+            $errors['attendees'] = ['One checkout can register at most 500 attendees.'];
+        }
+
         if ($errors !== []) {
             throw ValidationException::withMessages($errors);
         }
@@ -585,6 +635,7 @@ class CheckoutService
             'discount_minor' => 0,
             'total_minor' => $subtotal,
             'items' => $lines,
+            'registration_schemas' => $types->mapWithKeys(fn ($type) => [$type->event_id => app(RegistrationService::class)->schema($type->event)])->all(),
         ];
     }
 

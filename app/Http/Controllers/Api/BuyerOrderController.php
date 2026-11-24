@@ -27,7 +27,7 @@ class BuyerOrderController extends Controller
         $ticket = Ticket::where('public_id', $publicId)->with('orderItem.order')->firstOrFail();
         $order = $ticket->orderItem->order;
         $checkout->authorizeOrderAccess($order, auth('sanctum')->id(), $request->header('X-Checkout-Token'));
-        abort_unless($order->isPaid(), 403);
+        abort_unless($order->isFulfilled(), 403);
 
         return response()->json(['data' => [
             'public_id' => $ticket->public_id, 'token' => $ticket->token,

@@ -24,6 +24,7 @@ class PaymentFinalizer
             // Existing-order operations always lock order, sorted inventory, then payments.
             $order = Order::whereKey($attempt->order_id)->lockForUpdate()->firstOrFail();
             $types = TicketType::whereIn('id', $inventoryIds)->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+            $offer = app(DiscountService::class)->lockForOrder($order);
             $payment = Payment::whereKey($attempt->id)->lockForUpdate()->firstOrFail();
             if ($payment->status === Payment::STATUS_SUCCESS) {
                 return $order->load('items.tickets', 'payments', 'allocations');
@@ -45,6 +46,7 @@ class PaymentFinalizer
                     $latestId = $order->payments()->orderByDesc('id')->value('id');
                     if ((int) $latestId === (int) $payment->id && $order->status === Order::STATUS_PENDING_PAYMENT) {
                         $order->update(['status' => Order::STATUS_PAYMENT_FAILED]);
+                        app(DiscountService::class)->release($order);
                     }
                 }
 
@@ -56,7 +58,7 @@ class PaymentFinalizer
             if (in_array($order->status, [Order::STATUS_CANCELLED, Order::STATUS_REFUNDED, Order::STATUS_PAYMENT_REVIEW], true)) {
                 return $this->review($payment, $order, $providerData, 'terminal_order_charge');
             }
-            if ($order->isPaid()) {
+            if ($order->isFulfilled()) {
                 return $this->review($payment, $order, $providerData, 'additional_successful_payment');
             }
             $providerId = isset($providerData['id']) ? (string) $providerData['id'] : null;
@@ -66,6 +68,12 @@ class PaymentFinalizer
             $items = $order->items()->with('tickets')->orderBy('id')->get();
             // Always verify the entire commitment under inventory locks. Provider
             // payment time cannot resurrect a hold that has already been released.
+            if ($items->load('event')->contains(fn ($item) => $item->event->event_type === 'recurring')) {
+                return $this->review($payment, $order, $providerData, 'unsupported_recurring_charge');
+            }
+            if ($items->contains(fn ($i) => in_array($i->event->lifecycle_state, ['cancelled', 'completed', 'archived'], true))) {
+                return $this->review($payment, $order, $providerData, 'closed_event_charge');
+            }
             $committed = $this->inventory->reservedQuantities($inventoryIds, $order->id);
             foreach ($items as $item) {
                 $type = $types->get($item->ticket_type_id);
@@ -73,37 +81,53 @@ class PaymentFinalizer
                     return $this->review($payment, $order, $providerData, 'unfulfillable_charge');
                 }
             }
+            if (! app(DiscountService::class)->canReacquire($order, $offer)) {
+                return $this->review($payment, $order, $providerData, 'discount_limit_charge');
+            }
             try {
                 $paidAt = ! empty($providerData['paid_at']) ? Carbon::parse($providerData['paid_at']) : now();
             } catch (\Throwable) {
                 return $this->review($payment, $order, $providerData, 'invalid_payment_timestamp');
             }
+            app(ProviderFeeService::class)->record($payment, $providerData['fees'] ?? null);
             $payment->update([
                 'status' => Payment::STATUS_SUCCESS, 'provider_transaction_id' => $providerId,
                 'channel' => Str::limit((string) ($providerData['channel'] ?? ''), 50, ''),
                 'gateway_response' => 'Verified successful payment', 'paid_at' => $paidAt, 'verified_at' => now(),
             ]);
             $order->update(['status' => Order::STATUS_PAID, 'paid_at' => $paidAt]);
-            foreach ($items as $item) {
-                for ($index = $item->tickets->count(); $index < $item->quantity; $index++) {
-                    $token = Str::random(48);
-                    Ticket::create([
-                        'public_id' => (string) Str::ulid(), 'order_item_id' => $item->id,
-                        'event_id' => $item->event_id, 'ticket_type_id' => $item->ticket_type_id,
-                        'token' => $token, 'token_hash' => hash('sha256', $token),
-                        'admit_count' => max(1, $item->people_per_unit), 'status' => 'valid', 'issued_at' => now(),
-                    ]);
-                }
-            }
-            DB::table('commerce_deliveries')->insertOrIgnore([
-                'order_id' => $order->id, 'deduplication_key' => 'purchase:'.$order->id,
-                'kind' => 'purchase', 'next_attempt_at' => now(), 'created_at' => now(), 'updated_at' => now(),
-            ]);
+            app(DiscountService::class)->redeem($order);
+            $this->issueTickets($order);
 
             // The durable outbox is drained by commerce:dispatch, even if a worker
             // or web process crashes immediately after this commit.
             return $order->fresh()->load('items.tickets', 'payments', 'allocations');
         }, 3);
+    }
+
+    /** Caller holds order/inventory/offer locks in a transaction; no provider request here. */
+    public function issueTickets(Order $order): void
+    {
+        if ($order->user_id !== null) {
+            DB::afterCommit(fn () => \App\Services\RecommendationEngine::invalidate((int) $order->user_id));
+        }
+        foreach ($order->items()->with('tickets')->orderBy('id')->get() as $item) {
+            for ($index = $item->tickets->count(); $index < $item->quantity; $index++) {
+                $token = Str::random(48);
+                $issued = Ticket::create(['unit_index' => $index,
+                    'public_id' => (string) Str::ulid(), 'order_item_id' => $item->id,
+                    'event_id' => $item->event_id, 'ticket_type_id' => $item->ticket_type_id,
+                    'token' => $token, 'token_hash' => hash('sha256', $token),
+                    'admit_count' => max(1, $item->people_per_unit), 'status' => 'valid', 'issued_at' => now(),
+                ]);
+                app(RegistrationService::class)->link($issued, $index);
+            }
+        }
+        DB::table('commerce_deliveries')->insertOrIgnore([
+            'order_id' => $order->id, 'deduplication_key' => 'purchase:'.$order->id,
+            'kind' => 'purchase', 'next_attempt_at' => now(), 'created_at' => now(), 'updated_at' => now(),
+        ]);
+
     }
 
     private function review(Payment $payment, Order $order, array $data, string $reason): Order
@@ -114,8 +138,14 @@ class PaymentFinalizer
             'created_at' => now(), 'updated_at' => now(),
         ]);
         $payment->update(['status' => Payment::STATUS_REVIEW, 'gateway_response' => $reason, 'verified_at' => now()]);
-        if (! in_array($order->status, [Order::STATUS_PAID, Order::STATUS_CANCELLED, Order::STATUS_REFUNDED], true)) {
+        if (! $order->isFulfilled() && ! in_array($order->status, [Order::STATUS_CANCELLED, Order::STATUS_REFUNDED], true)) {
             $order->update(['status' => Order::STATUS_PAYMENT_REVIEW]);
+            app(DiscountService::class)->release($order);
+        }
+
+        FinancialAudit::record('payment.review', ['payment_id' => $payment->id, 'reason' => $reason], null, null, $order->id);
+        if (in_array($reason, ['terminal_order_charge', 'closed_event_charge'], true) && ($data['status'] ?? '') === 'success' && in_array($order->status, ['cancelled', 'payment_review'], true)) {
+            app(RefundService::class)->cancelledCharge($payment, $order, $data);
         }
 
         return $order->fresh()->load('items.tickets', 'payments', 'allocations');

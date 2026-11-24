@@ -25,7 +25,7 @@ class EventController extends Controller
             'date_from' => 'sometimes|date', 'date_to' => $request->filled('date_from') ? 'sometimes|date|after_or_equal:date_from' : 'sometimes|date',
             'sort' => 'sometimes|in:date-asc,date-desc,price-asc,price-desc,latest', 'featured' => 'sometimes|boolean',
         ]);
-        $query = Event::publiclyVisible()->with(['category', 'organizer', 'address', 'subCategories']);
+        $query = Event::publiclyVisible()->whereNotIn('lifecycle_state', ['archived', 'cancelled'])->with(['category', 'organizer', 'address', 'subCategories']);
         if ($request->filled('city')) {
             $query->whereHas('address', fn ($address) => $address->where('city_search', mb_strtolower(trim($request->city))));
         }
@@ -119,7 +119,7 @@ class EventController extends Controller
      */
     public function show(Event $event)
     {
-        abort_unless($event->status === 'active', 404);
+        abort_unless($event->status === 'active' && $event->lifecycle_state !== 'archived', 404);
         $event->load([
             'publicProfile',
             'media',
@@ -162,7 +162,7 @@ class EventController extends Controller
      */
     public function toggleLike(Event $event)
     {
-        abort_unless($event->status === 'active', 404);
+        abort_unless($event->status === 'active' && $event->lifecycle_state !== 'archived', 404);
         try {
             if (! auth()->check()) {
                 return response()->json([
@@ -202,7 +202,7 @@ class EventController extends Controller
      */
     public function checkLiked(Event $event)
     {
-        abort_unless($event->status === 'active', 404);
+        abort_unless($event->status === 'active' && $event->lifecycle_state !== 'archived', 404);
         if (! auth()->check()) {
             return response()->json(['liked' => false, 'likes_count' => 0], 200);
         }

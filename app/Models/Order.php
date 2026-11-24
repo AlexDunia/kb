@@ -9,11 +9,17 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class Order extends Model
 {
     public const STATUS_PENDING_PAYMENT = 'pending_payment';
+
     public const STATUS_PAID = 'paid';
+
     public const STATUS_PAYMENT_FAILED = 'payment_failed';
+
     public const STATUS_EXPIRED = 'expired';
+
     public const STATUS_PAYMENT_REVIEW = 'payment_review';
+
     public const STATUS_CANCELLED = 'cancelled';
+
     public const STATUS_REFUNDED = 'refunded';
 
     protected $fillable = [
@@ -72,5 +78,15 @@ class Order extends Model
     public function isPaid(): bool
     {
         return $this->status === self::STATUS_PAID;
+    }
+
+    public function attendees(): \Illuminate\Database\Eloquent\Relations\HasManyThrough
+    {
+        return $this->hasManyThrough(Attendee::class, OrderItem::class);
+    }
+
+    public function isFulfilled(): bool
+    {
+        return in_array($this->status, [self::STATUS_PAID, 'registered', 'partially_refunded'], true);
     }
 }

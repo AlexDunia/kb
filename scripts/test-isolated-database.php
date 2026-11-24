@@ -44,7 +44,7 @@ try {
         'DB_USERNAME' => (string) $connection['username'], 'DB_PASSWORD' => (string) $connection['password'],
         'CACHE_STORE' => 'array', 'SESSION_DRIVER' => 'array', 'QUEUE_CONNECTION' => 'sync',
     ]);
-    $process = proc_open([PHP_BINARY, $projectRoot.'/vendor/pestphp/pest/bin/pest'], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes, $projectRoot, $testEnvironment);
+    $process = proc_open([PHP_BINARY, $projectRoot.'/vendor/pestphp/pest/bin/pest', ...array_slice($argv, 1)], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes, $projectRoot, $testEnvironment);
     $status = is_resource($process) ? proc_close($process) : 6;
 } finally {
     // This identifier was generated and created above, never read from application configuration.

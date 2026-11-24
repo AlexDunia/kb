@@ -23,9 +23,21 @@ class OrderItem extends Model
         'quantity',
         'line_total_minor',
         'currency',
+        'registration_schema',
+        'discount_minor',
+        'platform_fee_minor',
+        'provider_fee_minor',
+        'refunded_minor',
+        'refunded_quantity',
     ];
 
     protected $casts = [
+        'registration_schema' => 'array',
+        'discount_minor' => 'integer',
+        'platform_fee_minor' => 'integer',
+        'provider_fee_minor' => 'integer',
+        'refunded_minor' => 'integer',
+        'refunded_quantity' => 'integer',
         'people_per_unit' => 'integer',
         'unit_price_minor' => 'integer',
         'quantity' => 'integer',
@@ -63,5 +75,10 @@ class OrderItem extends Model
             EventTrafficView::class,
             'attributed_event_view_id'
         );
+    }
+
+    public function attendees(): \Illuminate\Database\Eloquent\Relations\HasMany
+    {
+        return $this->hasMany(Attendee::class, 'order_item_id');
     }
 }

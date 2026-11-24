@@ -4,241 +4,92 @@ namespace App\Services;
 
 use App\Models\Event;
 use App\Models\User;
-use App\Models\Purchase;
-use App\Models\EventView;
-use App\Models\EventLike;
-use Illuminate\Support\Collection;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Cache;
+use App\Services\Commerce\InventoryService;
+use App\Support\Money;
 use Carbon\Carbon;
+use Illuminate\Database\Query\Builder;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 
 class RecommendationEngine
 {
-    private const CACHE_TTL = 30;
-    private const MAX_RECOMMENDATIONS = 10;
-    private const TOP_CATEGORIES_LIMIT = 3;
+    public function __construct(private readonly User $user) {}
 
-    private User $user;
-
-    public function __construct(User $user)
+    private function key(): string
     {
-        $this->user = $user;
+        return 'recommendations.v5.user.'.$this->user->id;
     }
 
     public function getRecommendations(): array
     {
-        $cacheKey = "recommendations.user.{$this->user->id}." . now()->format('YmdH');
+        return Cache::remember($this->key(), 30, function () {
+            $categories = $this->categories();
+            $base = fn () => Event::query()->with('category')->where('status', 'active')->where('lifecycle_state', 'open')->where(fn ($q) => $q->whereNull('booking_cutoff_at')->orWhere('booking_cutoff_at', '>', now()))->where('date', '>=', now())
+                ->whereNotIn('id', $this->purchased())->where('event_type', '!=', 'recurring');
+            $because = $categories ? $base()->whereIn('category_id', $categories)->orderBy('date')->orderBy('id')->limit(10)->get() : collect();
+            $lastViews = DB::query()->fromSub($this->views(), 'v')->groupBy('event_id')->selectRaw('event_id, MAX(viewed_at) AS last_viewed_at');
+            $jump = $base()->joinSub($lastViews, 'last_view', fn ($j) => $j->on('events.id', '=', 'last_view.event_id'))->select('events.*')->orderByDesc('last_view.last_viewed_at')->orderBy('events.id')->limit(10)->get();
+            $made = $categories ? $base()->whereIn('category_id', $categories)->whereNotIn('id', DB::query()->fromSub($this->views(), 'v')->select('event_id'))->whereNotIn('id', DB::table('event_likes')->where('user_id', $this->user->id)->select('event_id'))->orderByDesc('featured')->orderBy('date')->limit(10)->get() : collect();
 
-        return Cache::remember($cacheKey, self::CACHE_TTL, function () {
-            return [
-                'because_you_liked' => $this->getBecauseYouLikedRecommendations(),
-                'jump_back_in' => $this->getJumpBackInRecommendations(),
-                'made_for_you' => $this->getMadeForYouRecommendations(),
-            ];
+            return ['because_you_liked' => $this->format('Because you liked...', $because), 'jump_back_in' => $this->format('Jump back in...', $jump), 'made_for_you' => $this->format('Made for you...', $made)];
         });
     }
 
-    private function getBecauseYouLikedRecommendations(): array
+    private function purchased(): Builder
     {
-        $categoryIds = $this->getUserPreferredCategoryIds();
-
-        if ($categoryIds->isEmpty()) {
-            return $this->formatResponse('Because you liked...', collect());
-        }
-
-        $purchasedEventIds = $this->getUserPurchasedEventIds();
-
-        $events = Event::select([
-                'events.id',
-                'events.title',
-                'events.category_id',
-                'events.price',
-                'events.date',
-                'events.main_image',
-                'events.total_tickets',
-                'categories.name as category_name'
-            ])
-            ->join('categories', 'events.category_id', '=', 'categories.id')
-            ->whereIn('events.category_id', $categoryIds)
-            ->whereNotIn('events.id', $purchasedEventIds)
-            ->where('events.date', '>=', now())
-            ->where('events.total_tickets', '>', 0)
-            ->where('events.status', 'active')
-            ->orderBy('events.date', 'asc')
-            ->limit(self::MAX_RECOMMENDATIONS)
-            ->get();
-
-        return $this->formatResponse('Because you liked...', $events);
+        // Read-only legacy compatibility: preserve old completed purchase signals without copying or double-counting events.
+        return DB::table('purchases')->where('user_id', $this->user->id)->where('status', 'completed')->select('event_id')
+            ->union(DB::table('order_items as i')->join('orders as o', 'o.id', '=', 'i.order_id')->where('o.user_id', $this->user->id)->whereIn('o.status', ['paid', 'registered', 'partially_refunded'])->select('i.event_id'));
     }
 
-    private function getJumpBackInRecommendations(): array
+    private function views(): Builder
     {
-        $purchasedEventIds = $this->getUserPurchasedEventIds();
-
-        $events = Event::select([
-                'events.id',
-                'events.title',
-                'events.category_id',
-                'events.price',
-                'events.date',
-                'events.main_image',
-                'events.total_tickets',
-                'categories.name as category_name',
-                DB::raw('MAX(event_views.viewed_at) as last_viewed_at')
-            ])
-            ->join('categories', 'events.category_id', '=', 'categories.id')
-            ->join('event_views', 'events.id', '=', 'event_views.event_id')
-            ->where('event_views.user_id', $this->user->id)
-            ->whereNotIn('events.id', $purchasedEventIds)
-            ->where('events.date', '>=', now())
-            ->where('events.total_tickets', '>', 0)
-            ->where('events.status', 'active')
-            ->groupBy([
-                'events.id',
-                'events.title',
-                'events.category_id',
-                'events.price',
-                'events.date',
-                'events.main_image',
-                'events.total_tickets',
-                'categories.name'
-            ])
-            ->orderBy('last_viewed_at', 'desc')
-            ->limit(self::MAX_RECOMMENDATIONS)
-            ->get();
-
-        return $this->formatResponse('Jump back in...', $events);
+        return DB::table('event_views')->where('user_id', $this->user->id)->select(['event_id', 'viewed_at'])
+            ->union(DB::table('event_traffic_views')->where('user_id', $this->user->id)->select(['event_id', 'viewed_at']));
     }
 
-    private function getMadeForYouRecommendations(): array
+    private function categories(): array
     {
-        $topCategoryIds = $this->getTopCategoriesByInteraction();
+        // Independent signals are aggregated before combining, avoiding purchase x like x view join multiplication.
+        $purchases = DB::query()->fromSub($this->purchased(), 'p')->selectRaw('event_id, 10 AS weight');
+        $likes = DB::table('event_likes')->where('user_id', $this->user->id)->selectRaw('event_id, 5 AS weight');
+        $views = DB::query()->fromSub($this->views(), 'v')->groupBy('event_id')->selectRaw('event_id, 1 AS weight');
 
-        if ($topCategoryIds->isEmpty()) {
-            return $this->formatResponse('Made for you...', collect());
-        }
-
-        $interactedEventIds = $this->getUserInteractedEventIds();
-
-        $events = Event::select([
-                'events.id',
-                'events.title',
-                'events.category_id',
-                'events.price',
-                'events.date',
-                'events.main_image',
-                'events.total_tickets',
-                'events.featured',
-                'categories.name as category_name'
-            ])
-            ->join('categories', 'events.category_id', '=', 'categories.id')
-            ->whereIn('events.category_id', $topCategoryIds)
-            ->whereNotIn('events.id', $interactedEventIds)
-            ->where('events.date', '>=', now())
-            ->where('events.total_tickets', '>', 0)
-            ->where('events.status', 'active')
-            ->orderByRaw('events.featured DESC, events.date ASC')
-            ->limit(self::MAX_RECOMMENDATIONS)
-            ->get();
-
-        return $this->formatResponse('Made for you...', $events);
+        return DB::query()->fromSub($purchases->unionAll($likes)->unionAll($views), 'signals')->join('events as e', 'e.id', '=', 'signals.event_id')
+            ->whereNotNull('e.category_id')->groupBy('e.category_id')->orderByRaw('SUM(signals.weight) DESC')->orderBy('e.category_id')->limit(3)->pluck('e.category_id')->all();
     }
 
-    private function getUserPreferredCategoryIds(): Collection
+    private function format(string $label, Collection $events): array
     {
-        return DB::table('events')
-            ->select('category_id')
-            ->whereIn('id', function ($query) {
-                $query->select('event_id')
-                    ->from('purchases')
-                    ->where('user_id', $this->user->id)
-                    ->union(
-                        DB::table('event_likes')
-                            ->select('event_id')
-                            ->where('user_id', $this->user->id)
-                    );
-            })
-            ->distinct()
-            ->pluck('category_id');
+        $events->load('ticketTypes');
+        $ids = $events->flatMap(fn ($e) => $e->ticketTypes->pluck('id'))->unique()->all();
+        $committed = app(InventoryService::class)->reservedQuantities($ids);
+        $currency = strtoupper(config('commerce.currency', 'NGN'));
+        $rows = $events->map(function ($e) use ($committed, $currency) {
+            $types = $e->ticketTypes->filter(fn ($t) => ! $t->retired_at && ($t->visible || $t->is_registration) && (! $t->sales_start_date || $t->sales_start_date->lte(now())) && (! $t->sales_end_date || $t->sales_end_date->gte(now())));
+            $available = $types->sum(fn ($t) => max(0, $t->quantity - ($committed[$t->id] ?? 0)));
+            if ($e->ticket_mode === 'free' && $types->isEmpty()) {
+                $available = max(0, (int) $e->total_tickets);
+            }
+            if (! $available) {
+                return null;
+            }
+            $minor = $e->ticket_mode === 'free' ? 0 : $types->min(fn ($t) => Money::decimalToMinor($t->price));
+
+            return ['id' => $e->id, 'title' => $e->title, 'category_id' => $e->category_id, 'category_name' => $e->category?->name, 'price' => $minor / 100, 'price_minor' => $minor, 'currency' => $currency, 'formatted_price' => $currency.' '.number_format($minor / 100, 2), 'date' => $e->date, 'formatted_date' => Carbon::parse($e->date)->format('M d, Y'), 'main_image' => $e->main_image, 'tickets_available' => $available, 'is_featured' => (bool) $e->featured];
+        })->filter()->values()->all();
+
+        return ['label' => $label, 'count' => count($rows), 'events' => $rows];
     }
 
-    private function getUserPurchasedEventIds(): Collection
+    public static function invalidate(int $userId): void
     {
-        return Purchase::where('user_id', $this->user->id)
-            ->pluck('event_id');
-    }
-
-    private function getUserInteractedEventIds(): Collection
-    {
-        $purchased = Purchase::where('user_id', $this->user->id)
-            ->pluck('event_id');
-
-        $viewed = EventView::where('user_id', $this->user->id)
-            ->pluck('event_id');
-
-        $liked = EventLike::where('user_id', $this->user->id)
-            ->pluck('event_id');
-
-        return $purchased->merge($viewed)->merge($liked)->unique();
-    }
-
-    private function getTopCategoriesByInteraction(): Collection
-    {
-        $topCategories = DB::table('events')
-            ->select('events.category_id', DB::raw('
-                (
-                    COALESCE(SUM(CASE WHEN purchases.id IS NOT NULL THEN 10 ELSE 0 END), 0) +
-                    COALESCE(SUM(CASE WHEN event_likes.id IS NOT NULL THEN 5 ELSE 0 END), 0) +
-                    COALESCE(SUM(CASE WHEN event_views.id IS NOT NULL THEN 1 ELSE 0 END), 0)
-                ) as interaction_score
-            '))
-            ->leftJoin('purchases', function ($join) {
-                $join->on('events.id', '=', 'purchases.event_id')
-                    ->where('purchases.user_id', '=', $this->user->id);
-            })
-            ->leftJoin('event_likes', function ($join) {
-                $join->on('events.id', '=', 'event_likes.event_id')
-                    ->where('event_likes.user_id', '=', $this->user->id);
-            })
-            ->leftJoin('event_views', function ($join) {
-                $join->on('events.id', '=', 'event_views.event_id')
-                    ->where('event_views.user_id', '=', $this->user->id);
-            })
-            ->groupBy('events.category_id')
-            ->having('interaction_score', '>', 0)
-            ->orderBy('interaction_score', 'desc')
-            ->limit(self::TOP_CATEGORIES_LIMIT)
-            ->pluck('category_id');
-
-        return $topCategories;
-    }
-
-    private function formatResponse(string $label, Collection $events): array
-    {
-        return [
-            'label' => $label,
-            'count' => $events->count(),
-            'events' => $events->map(function ($event) {
-                return [
-                    'id' => $event->id,
-                    'title' => $event->title,
-                    'category_id' => $event->category_id,
-                    'category_name' => $event->category_name ?? null,
-                    'price' => (float) $event->price,
-                    'formatted_price' => '$' . number_format($event->price, 2),
-                    'date' => $event->date,
-                    'formatted_date' => Carbon::parse($event->date)->format('M d, Y'),
-                    'main_image' => $event->main_image,
-                    'tickets_available' => $event->total_tickets,
-                    'is_featured' => $event->featured ?? false,
-                ];
-            })->values()->all()
-        ];
+        Cache::forget('recommendations.v5.user.'.$userId);
     }
 
     public function clearCache(): void
     {
-        $cacheKey = "recommendations.user.{$this->user->id}." . now()->format('YmdH');
-        Cache::forget($cacheKey);
+        self::invalidate($this->user->id);
     }
 }

@@ -26,6 +26,7 @@ class CreateEventService
                 $event = $existingEventId ? Event::whereKey($existingEventId)->lockForUpdate()->firstOrFail() : new Event;
                 if ($event->exists) {
                     abort_unless($userId !== null && (int) $event->created_by === $userId, 403);
+                    abort_unless(in_array($event->lifecycle_state ?? 'open', ['open', 'sales_closed'], true), 409, 'This event can no longer be edited.');
                     abort_unless(in_array($event->status, ['draft', 'active'], true), 422, 'This event cannot be edited in its current state.');
                     abort_unless(isset($input['version']), 428, 'An event version is required. Reload the editor first.');
                     abort_unless(filter_var($input['version'], FILTER_VALIDATE_INT) !== false && (int) $input['version'] === (int) $event->lock_version, 409, 'This event changed. Reload it before saving again.');
@@ -106,6 +107,9 @@ class CreateEventService
                 if ($event->exists && ($payload['ticketMode'] ?? 'free') !== $event->ticket_mode && array_sum($this->inventory->reservedQuantities($event->ticketTypes->pluck('id')->all())) > 0) {
                     throw ValidationException::withMessages(['ticketMode' => ['Ticket mode cannot change while sold or reserved commitments exist.']]);
                 }
+                if ($event->exists && ($payload['eventType'] ?? 'one_time') !== $event->event_type && OrderItem::where('event_id', $event->id)->exists()) {
+                    throw ValidationException::withMessages(['eventType' => ['Recurrence semantics cannot change after registration or checkout history exists.']]);
+                }
                 foreach (['title', 'description', 'venue', 'city', 'organiser', 'tags'] as $field) {
                     if (isset($payload[$field])) {
                         $payload[$field] = $this->text($payload[$field]);
@@ -119,6 +123,9 @@ class CreateEventService
                     }
                 }
                 $payload = $this->validation->validate($payload, $publish || $event->status === 'active');
+                if ($event->booking_cutoff_at && ! empty($payload['endsAt']) && \Carbon\Carbon::parse($payload['endsAt'])->lt($event->booking_cutoff_at)) {
+                    throw ValidationException::withMessages(['endsAt' => ['Event end must not precede the booking cutoff.']]);
+                }
                 $oldUrls = $event->exists ? array_merge($event->media->pluck('url')->all(), array_filter([$event->main_image, $event->banner_url]), $this->profileImageUrls($event)) : [];
                 $category = trim($payload['category'] ?? '');
                 $categoryId = $category === '' ? null : Category::whereRaw('LOWER(name) = ?', [mb_strtolower($category)])->value('id');
@@ -210,7 +217,15 @@ class CreateEventService
 
     private function syncTicketTypes(Event $event, array $payload): void
     {
-        $existing = $event->ticketTypes()->get()->keyBy('id');
+        $existing = $event->ticketTypes()->where('is_registration', false)->get()->keyBy('id');
+        $registration = $event->ticketTypes()->where('is_registration', true)->first();
+        if ($registration && $payload['ticketMode'] === 'free') {
+            $committed = $this->inventory->reservedQuantities([$registration->id])[$registration->id] ?? 0;
+            if ((int) ($payload['freeCapacity'] ?? 0) < $committed) {
+                throw ValidationException::withMessages(['freeCapacity' => ['Capacity cannot be less than existing registrations.']]);
+            }
+            $registration->update(['quantity' => (int) ($payload['freeCapacity'] ?? 0)]);
+        }
         $counts = $this->inventory->reservedQuantities($existing->keys()->all());
         $kept = [];
         foreach ($payload['tickets'] as $i => $ticket) {
@@ -289,7 +304,7 @@ class CreateEventService
             'secondaryImages' => $event->media->where('is_cover', false)->sortBy('sort_order')->pluck('url')->values()->all(),
             'ticketMode' => $event->ticket_mode,
             'freeCapacity' => $event->ticket_mode === 'free' ? $event->total_tickets : null,
-            'tickets' => $event->ticketTypes->whereNull('retired_at')->map(fn ($ticket) => [
+            'tickets' => $event->ticketTypes->where('is_registration', false)->whereNull('retired_at')->map(fn ($ticket) => [
                 'id' => $ticket->id,
                 'inventory' => [
                     'configured_capacity_units' => (int) $ticket->quantity,

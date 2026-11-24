@@ -84,10 +84,10 @@ class EventAttributionService
         ) {
             $attempt++;
             $suffix = strtolower(Str::random(4));
-            $sourceCode = substr($base, 0, 27) . '-' . $suffix;
+            $sourceCode = substr($base, 0, 27).'-'.$suffix;
 
             if ($attempt >= 10) {
-                $sourceCode = 'link-' . strtolower(Str::random(10));
+                $sourceCode = 'link-'.strtolower(Str::random(10));
                 break;
             }
         }
@@ -151,13 +151,17 @@ class EventAttributionService
             $view->forceFill($changes)->save();
         }
 
+        if ($userId !== null && ($view->wasRecentlyCreated || $changes !== [])) {
+            \App\Services\RecommendationEngine::invalidate($userId);
+        }
+
         return $view->fresh();
     }
 
     /**
      * Last tagged touch, per event, during the attribution window.
      *
-     * @param array<int, int> $eventIds
+     * @param  array<int, int>  $eventIds
      * @return array<int, array{view_id:int,source_code:string}>
      */
     public function latestAttributionForVisitor(
@@ -172,13 +176,12 @@ class EventAttributionService
 
         $visitorHash = $this->hashVisitor($visitorId);
 
-        $views = EventTrafficView::query()
-            ->where('visitor_hash', $visitorHash)
-            ->whereIn('event_id', $eventIds)
-            ->whereNotNull('source_code')
-            ->where('viewed_at', '>=', now()->subDays(self::ATTRIBUTION_DAYS))
-            ->orderByDesc('viewed_at')
-            ->get(['id', 'event_id', 'source_code']);
+        $views = EventTrafficView::query()->where('visitor_hash', $visitorHash)->whereIn('event_id', $eventIds)
+            ->where('id', function ($q) use ($visitorHash) {
+                $q->select('recent.id')->from('event_traffic_views as recent')->whereColumn('recent.event_id', 'event_traffic_views.event_id')
+                    ->where('recent.visitor_hash', $visitorHash)->whereNotNull('recent.source_code')->where('recent.viewed_at', '>=', now()->subDays(self::ATTRIBUTION_DAYS))
+                    ->orderByDesc('recent.viewed_at')->orderByDesc('recent.id')->limit(1);
+            })->get(['id', 'event_id', 'source_code']);
 
         $result = [];
 

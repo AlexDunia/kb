@@ -67,11 +67,8 @@ class DashboardAnalyticsService
         $reservedUnits = collect($ticketPerformance)->sum('reserved_units');
         $availableUnits = collect($ticketPerformance)->sum('available_units');
 
-        if (($event->ticket_mode ?? 'free') !== 'paid') {
-            $salesCapacity = (int) ($event->total_tickets ?? 0);
-            $soldUnits = 0;
-            $reservedUnits = 0;
-            $availableUnits = $salesCapacity;
+        if ($event->ticket_mode === 'free' && ! $ticketPerformance) {
+            $salesCapacity = $availableUnits = max(0, (int) $event->total_tickets);
         }
 
         $admissionCapacity = collect($ticketPerformance)->sum(
@@ -79,17 +76,17 @@ class DashboardAnalyticsService
                 * max(1, (int) $tier['people_per_unit'])
         );
 
-        $admissionEntriesCovered = collect($ticketPerformance)->sum(
-            fn (array $tier) => (int) $tier['sold_units']
-                * max(1, (int) $tier['people_per_unit'])
-        );
-
-        if (($event->ticket_mode ?? 'free') !== 'paid') {
-            $admissionCapacity = (int) ($event->total_tickets ?? 0);
-            $admissionEntriesCovered = 0;
+        if ($event->ticket_mode === 'free') {
+            $admissionCapacity = max(0, (int) $event->total_tickets);
         }
 
+        $metrics = app(EventMetricsService::class)->metrics($event);
+        $admissionEntriesCovered = DB::table('order_items')->join('orders', 'orders.id', '=', 'order_items.order_id')
+            ->where('order_items.event_id', $event->id)->whereIn('orders.status', ['paid', 'registered'])
+            ->selectRaw('COALESCE(SUM((order_items.quantity - order_items.refunded_quantity) * order_items.people_per_unit),0) AS total')->value('total');
+
         return [
+            'metrics' => $metrics,
             'event' => [
                 ...$this->eventListItem($event),
                 'currency' => strtoupper((string) config('commerce.currency', 'NGN')),
@@ -114,8 +111,10 @@ class DashboardAnalyticsService
                 // separate because people_per_unit is useful for door capacity,
                 // not for saying how many ticket products were sold.
                 'admission_capacity' => $admissionCapacity,
-                'admission_entries_covered' => $admissionEntriesCovered,
-                'tracking_supported' => ($event->ticket_mode ?? 'free') === 'paid',
+                'admission_entries_covered' => (int) $admissionEntriesCovered,
+                'actual_attendance' => $metrics['actual_attendance'],
+                'currently_inside' => $metrics['currently_inside'],
+                'tracking_supported' => true,
             ],
             'revenue' => [
                 'currency' => strtoupper((string) config('commerce.currency', 'NGN')),
@@ -138,8 +137,12 @@ class DashboardAnalyticsService
                 '7d' => $timeline['series_7d'],
                 '30d' => $timeline['series_30d'],
                 'all' => $timeline['series_all'],
+                'max_days' => 1095,
+                'truncated' => $timeline['truncated'],
+                'from' => $timeline['series_all'][0]['date'] ?? null,
             ],
             'best_sales_day' => [
+                'scope' => 'chart_window',
                 'this_week' => $timeline['best_this_week'],
                 'overall' => $timeline['best_overall'],
             ],
@@ -196,12 +199,12 @@ class DashboardAnalyticsService
             ->join('orders', 'orders.id', '=', 'order_items.order_id')
             ->where('order_items.event_id', $event->id)
             ->whereIn('order_items.ticket_type_id', $ids)
-            ->where('orders.status', Order::STATUS_PAID)
+            ->whereIn('orders.status', [Order::STATUS_PAID, 'registered', 'partially_refunded'])
             ->groupBy('order_items.ticket_type_id')
             ->selectRaw(
                 'order_items.ticket_type_id,
                  COALESCE(SUM(order_items.quantity), 0) AS sold_units,
-                 COALESCE(SUM(order_items.line_total_minor), 0) AS revenue_minor'
+                 COALESCE(SUM(order_items.line_total_minor - order_items.discount_minor), 0) AS revenue_minor'
             )
             ->get()
             ->keyBy(fn ($row) => (int) $row->ticket_type_id);
@@ -219,7 +222,7 @@ class DashboardAnalyticsService
                 // A hidden tier with history is preserved by CreateEventService.
                 // Once hidden, its unsold inventory is no longer offered, so the
                 // dashboard denominator becomes the number already sold.
-                $effectiveCapacity = $type->visible
+                $effectiveCapacity = ($type->visible || $type->is_registration)
                     ? max($configuredCapacity, $sold)
                     : $sold + $reservedUnits;
 
@@ -249,11 +252,7 @@ class DashboardAnalyticsService
             ->all();
     }
 
-    /**
-     * Build every time-based sales metric from one streaming event-order query.
-     * One order may contain several ticket types for the event, so the database
-     * first collapses those rows into one event total per order.
-     */
+    /** SQL aggregates at most 1,095 local days into daily and buying-time buckets. */
     private function salesTimeline(
         Event $event,
         string $timezone,
@@ -282,69 +281,37 @@ class DashboardAnalyticsService
 
         $firstSaleDate = null;
 
-        $rows = $this->paidEventOrdersQuery($event)
-            ->groupBy(
-                'orders.id',
-                'orders.paid_at'
-            )
-            ->selectRaw(
-                'orders.id,
-                 orders.paid_at,
-                 COALESCE(SUM(order_items.quantity), 0) AS units_sold,
-                 COALESCE(SUM(order_items.line_total_minor), 0) AS revenue_minor'
-            )
-            ->orderBy('orders.paid_at')
-            ->cursor();
-
+        // Aggregate in SQL after converting UTC instants with IANA transition offsets.
+        // Numeric offsets avoid optional MySQL timezone tables and preserve DST and half-hour zones.
+        $instant = 'COALESCE(orders.paid_at, orders.created_at)';
+        $first = $this->paidEventOrdersQuery($event)->min(DB::raw($instant));
+        $chartStart = $first ? CarbonImmutable::parse($first, 'UTC')->setTimezone($timezone)->startOfDay()->max($now->startOfDay()->subDays(1094)) : $now->startOfDay();
+        $local = $this->localTimeSql($instant, $timezone, $chartStart->utc(), $now->utc()->addDay());
+        $hour = DB::getDriverName() === 'sqlite' ? "CAST(strftime('%H', {$local}) AS INTEGER)" : "HOUR({$local})";
+        $bucket = "CASE WHEN {$hour} < 4 THEN '00-04' WHEN {$hour} < 8 THEN '04-08' WHEN {$hour} < 12 THEN '08-12' WHEN {$hour} < 16 THEN '12-16' WHEN {$hour} < 19 THEN '16-19' WHEN {$hour} < 23 THEN '19-23' ELSE '23-24' END";
+        $rows = $this->paidEventOrdersQuery($event)->whereRaw("{$instant} >= ?", [$chartStart->utc()])->whereRaw("{$instant} <= ?", [$now->utc()])
+            ->selectRaw("DATE({$local}) AS day, {$bucket} AS bucket, SUM(order_items.quantity) AS units_sold, SUM(order_items.line_total_minor - order_items.discount_minor) AS revenue_minor, COUNT(DISTINCT orders.id) AS orders")
+            ->groupBy('day', 'bucket')->orderBy('day')->get();
         foreach ($rows as $row) {
-            if (! $row->paid_at) {
-                continue;
+            $daily[$row->day] ??= ['date' => $row->day, 'units_sold' => 0, 'revenue_minor' => 0, 'orders' => 0];
+            foreach (['units_sold', 'revenue_minor', 'orders'] as $key) {
+                $daily[$row->day][$key] += (int) $row->$key;
+                $buckets[$row->bucket][$key] += (int) $row->$key;
             }
-
-            $paidAt = CarbonImmutable::parse(
-                (string) $row->paid_at,
-                'UTC'
-            )->setTimezone($timezone);
-
-            $units = (int) $row->units_sold;
-            $revenue = (int) $row->revenue_minor;
-            $dateKey = $paidAt->format('Y-m-d');
-
-            $firstSaleDate ??= $paidAt->startOfDay();
-
-            if (! isset($daily[$dateKey])) {
-                $daily[$dateKey] = [
-                    'date' => $dateKey,
-                    'units_sold' => 0,
-                    'revenue_minor' => 0,
-                    'orders' => 0,
-                ];
+        }
+        $totals = $this->paidEventOrdersQuery($event)->selectRaw('COALESCE(SUM(order_items.quantity),0) AS units, COALESCE(SUM(order_items.line_total_minor - order_items.discount_minor),0) AS revenue')->first();
+        $totalUnits = (int) $totals->units;
+        $totalRevenue = (int) $totals->revenue;
+        $firstSaleDate = $first ? CarbonImmutable::parse($first, 'UTC')->setTimezone($timezone)->startOfDay() : null;
+        foreach ([[$currentWeekStart, $now, 'current'], [$previousWeekStart, $previousComparableEnd, 'previous']] as [$from,$to,$period]) {
+            $sum = $this->paidEventOrdersQuery($event)->whereRaw("{$instant} BETWEEN ? AND ?", [$from->utc(), $to->utc()])->selectRaw('COALESCE(SUM(order_items.quantity),0) AS units, COALESCE(SUM(order_items.line_total_minor - order_items.discount_minor),0) AS revenue')->first();
+            if ($period === 'current') {
+                $thisWeekUnits = (int) $sum->units;
+                $thisWeekRevenue = (int) $sum->revenue;
+            } else {
+                $previousUnits = (int) $sum->units;
+                $previousRevenue = (int) $sum->revenue;
             }
-
-            $daily[$dateKey]['units_sold'] += $units;
-            $daily[$dateKey]['revenue_minor'] += $revenue;
-            $daily[$dateKey]['orders']++;
-
-            $totalUnits += $units;
-            $totalRevenue += $revenue;
-
-            if ($paidAt >= $currentWeekStart && $paidAt <= $now) {
-                $thisWeekUnits += $units;
-                $thisWeekRevenue += $revenue;
-            }
-
-            if (
-                $paidAt >= $previousWeekStart
-                && $paidAt <= $previousComparableEnd
-            ) {
-                $previousUnits += $units;
-                $previousRevenue += $revenue;
-            }
-
-            $bucketKey = $this->buyingTimeBucketKey($paidAt->hour);
-            $buckets[$bucketKey]['orders']++;
-            $buckets[$bucketKey]['units_sold'] += $units;
-            $buckets[$bucketKey]['revenue_minor'] += $revenue;
         }
 
         ksort($daily);
@@ -363,7 +330,10 @@ class DashboardAnalyticsService
             $today
         );
 
-        $allStart = $firstSaleDate ?? $today;
+        $allStart = $firstSaleDate && $firstSaleDate > $today->subDays(1094) ? $firstSaleDate : $today->subDays(1094);
+        if (! $firstSaleDate) {
+            $allStart = $today;
+        }
 
         $seriesAll = $this->fillDailySeries(
             $daily,
@@ -372,6 +342,7 @@ class DashboardAnalyticsService
         );
 
         return [
+            'truncated' => $firstSaleDate && $firstSaleDate < $today->subDays(1094),
             'total_units' => $totalUnits,
             'total_revenue_minor' => $totalRevenue,
             'this_week_units' => $thisWeekUnits,
@@ -431,7 +402,7 @@ class DashboardAnalyticsService
                 }
             )
             ->where('order_items.event_id', $event->id)
-            ->where('orders.status', Order::STATUS_PAID)
+            ->whereIn('orders.status', [Order::STATUS_PAID, 'registered', 'partially_refunded'])
             ->whereNotNull('orders.visitor_hash')
             ->distinct()
             ->count('orders.visitor_hash');
@@ -466,7 +437,7 @@ class DashboardAnalyticsService
         return (int) $this->paidEventOrdersQuery($event)
             ->whereNotNull('orders.customer_email')
             ->distinct()
-            ->count('orders.customer_email');
+            ->count(DB::raw('LOWER(TRIM(orders.customer_email))'));
     }
 
     /**
@@ -484,56 +455,22 @@ class DashboardAnalyticsService
             ->where('event_id', $event->id)
             ->pluck('label', 'source_code');
 
-        $latestBuyerSource = [];
-        $sourceUnits = [];
-        $sourceRevenue = [];
-
-        $purchaseRows = DB::table('order_items')
-            ->join('orders', 'orders.id', '=', 'order_items.order_id')
-            ->where('order_items.event_id', $event->id)
-            ->where('orders.status', Order::STATUS_PAID)
-            ->whereNotNull('orders.customer_email')
-            ->orderByDesc('orders.paid_at')
-            ->orderByDesc('orders.id')
-            ->select([
-                'orders.customer_email',
-                'orders.paid_at',
-                'order_items.source_code',
-                'order_items.quantity',
-                'order_items.line_total_minor',
-            ])
-            ->cursor();
-
-        foreach ($purchaseRows as $row) {
-            $email = strtolower(trim((string) $row->customer_email));
-
-            if ($email === '') {
-                continue;
-            }
-
-            $sourceCode = $row->source_code
-                ? (string) $row->source_code
-                : 'unattributed';
-
-            $sourceUnits[$sourceCode] =
-                ($sourceUnits[$sourceCode] ?? 0)
-                + (int) $row->quantity;
-
-            $sourceRevenue[$sourceCode] =
-                ($sourceRevenue[$sourceCode] ?? 0)
-                + (int) $row->line_total_minor;
-
-            if (! isset($latestBuyerSource[$email])) {
-                $latestBuyerSource[$email] = $sourceCode;
-            }
-        }
-
-        $buyerCounts = [];
-
-        foreach ($latestBuyerSource as $sourceCode) {
-            $buyerCounts[$sourceCode] =
-                ($buyerCounts[$sourceCode] ?? 0) + 1;
-        }
+        $base = DB::table('order_items as i')->join('orders as o', 'o.id', '=', 'i.order_id')
+            ->where('i.event_id', $event->id)->whereIn('o.status', ['paid', 'registered', 'partially_refunded', 'refunded']);
+        $latest = (clone $base)->groupByRaw('LOWER(TRIM(o.customer_email))')->selectRaw('LOWER(TRIM(o.customer_email)) AS email, MAX(o.id) AS order_id');
+        $lastSources = DB::query()->fromSub($latest, 'last_order')->join('order_items as i', function ($j) use ($event) {
+            $j->on('i.order_id', '=', 'last_order.order_id')->where('i.event_id', $event->id);
+        })
+            ->groupBy('last_order.email')->selectRaw("last_order.email, COALESCE(MIN(i.source_code), 'unattributed') AS source_code");
+        $buyerCounts = DB::query()->fromSub($lastSources, 'buyer_sources')->groupBy('source_code')->selectRaw('source_code, COUNT(*) AS buyers')->pluck('buyers', 'source_code')->all();
+        $sales = (clone $base)->where('i.currency', strtoupper(config('commerce.currency', 'NGN')))
+            ->groupByRaw("COALESCE(i.source_code, 'unattributed')")->selectRaw("COALESCE(i.source_code, 'unattributed') AS source_code, SUM(i.quantity) AS units, SUM(i.line_total_minor - i.discount_minor) AS revenue")->get();
+        $sourceUnits = $sales->pluck('units', 'source_code')->all();
+        $sourceRevenue = $sales->pluck('revenue', 'source_code')->all();
+        $conversions = DB::table('order_items as i')->join('orders as o', 'o.id', '=', 'i.order_id')
+            ->join('event_traffic_views as v', 'v.id', '=', 'i.attributed_event_view_id')
+            ->where('i.event_id', $event->id)->where('v.event_id', $event->id)->whereIn('o.status', ['paid', 'registered', 'partially_refunded', 'refunded'])
+            ->whereColumn('o.visitor_hash', 'v.visitor_hash')->groupBy('i.source_code')->selectRaw('i.source_code, COUNT(DISTINCT o.visitor_hash) AS visitors')->pluck('visitors', 'i.source_code');
 
         $trafficBySource = EventTrafficView::query()
             ->where('event_id', $event->id)
@@ -572,7 +509,7 @@ class DashboardAnalyticsService
                 $sourceRevenue,
                 $viewsBySource,
                 $uniqueVisitorsBySource,
-                $totalUniqueBuyers
+                $totalUniqueBuyers, $conversions
             ) {
                 $buyers = (int) ($buyerCounts[$code] ?? 0);
                 $uniqueVisitors =
@@ -591,7 +528,7 @@ class DashboardAnalyticsService
                     'views' => (int) $viewsBySource->get($code, 0),
                     'unique_visitors' => $uniqueVisitors,
                     'conversion_percent' => $this->percent(
-                        $buyers,
+                        (int) ($conversions[$code] ?? 0),
                         $uniqueVisitors
                     ),
                     'units_sold' => (int) ($sourceUnits[$code] ?? 0),
@@ -608,8 +545,23 @@ class DashboardAnalyticsService
         return DB::table('order_items')
             ->join('orders', 'orders.id', '=', 'order_items.order_id')
             ->where('order_items.event_id', $event->id)
-            ->where('orders.status', Order::STATUS_PAID)
-            ->whereNotNull('orders.paid_at');
+            ->whereIn('orders.status', [Order::STATUS_PAID, 'registered', 'partially_refunded', 'refunded'])
+            ->where('order_items.currency', strtoupper(config('commerce.currency', 'NGN')));
+    }
+
+    private function localTimeSql(string $instant, string $timezone, CarbonImmutable $from, CarbonImmutable $to): string
+    {
+        $zone = new \DateTimeZone($timezone);
+        $transitions = $zone->getTransitions($from->getTimestamp(), $to->getTimestamp());
+        $offset = (int) $zone->getOffset($from);
+        $cases = [];
+        foreach ($transitions ?: [] as $transition) {
+            $date = gmdate('Y-m-d H:i:s', $transition['ts']);
+            $cases[] = "WHEN {$instant} >= '{$date}' THEN ".(int) $transition['offset'];
+        }
+        $seconds = $cases ? '(CASE '.implode(' ', array_reverse($cases)).' ELSE '.$offset.' END)' : (string) $offset;
+
+        return DB::getDriverName() === 'sqlite' ? "datetime({$instant}, printf('%+d seconds', {$seconds}))" : "DATE_ADD({$instant}, INTERVAL {$seconds} SECOND)";
     }
 
     private function fillDailySeries(

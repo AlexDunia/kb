@@ -16,20 +16,19 @@ class DashboardController extends Controller
         Request $request,
         DashboardAnalyticsService $analytics
     ): JsonResponse {
+        $v = $request->validate(['per_page' => 'sometimes|integer|min:1|max:100', 'page' => 'sometimes|integer|min:1']);
         $events = Event::query()
             ->where('created_by', $request->user()->id)
             ->with('address')
             ->orderByRaw("CASE WHEN status = 'active' THEN 0 ELSE 1 END")
             ->orderBy('date')
-            ->get()
-            ->map(
-                fn (Event $event) => $analytics->eventListItem($event)
-            )
-            ->values();
+            ->orderBy('id')
+            ->paginate($v['per_page'] ?? 30);
+        $events->through(
+            fn (Event $event) => $analytics->eventListItem($event)
+        );
 
-        return response()->json([
-            'data' => $events,
-        ]);
+        return response()->json($events);
     }
 
     public function overview(

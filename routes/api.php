@@ -205,3 +205,60 @@ Route::get('/buyer/orders', [\App\Http\Controllers\Api\BuyerOrderController::cla
 Route::get('/buyer/tickets/{publicId}', [\App\Http\Controllers\Api\BuyerOrderController::class, 'ticket']);
 Route::post('/checkout/recovery/request', [\App\Http\Controllers\Api\BuyerOrderController::class, 'requestRecovery'])->middleware('throttle:5,10');
 Route::post('/checkout/recovery/exchange', [\App\Http\Controllers\Api\BuyerOrderController::class, 'exchangeRecovery'])->middleware('throttle:10,10');
+
+Route::post('/events/{event}/registrations', [\App\Http\Controllers\Api\EventOperationsController::class, 'register'])->middleware('throttle:10,1');
+Route::middleware('auth:sanctum')->prefix('event-operations/{event}')->group(function () {
+    Route::get('/admission', [\App\Http\Controllers\Api\AdmissionController::class, 'context']);
+    Route::post('/admission/lookup', [\App\Http\Controllers\Api\AdmissionController::class, 'lookup'])->middleware('throttle:60,1');
+    Route::post('/admission/movements', [\App\Http\Controllers\Api\AdmissionController::class, 'move'])->middleware('throttle:120,1');
+    Route::get('/admission/history', [\App\Http\Controllers\Api\AdmissionController::class, 'history']);
+    Route::put('/admission/settings', [\App\Http\Controllers\Api\EventStaffController::class, 'settings']);
+    Route::get('/entrances', [\App\Http\Controllers\Api\EventStaffController::class, 'entrances']);
+    Route::post('/entrances', [\App\Http\Controllers\Api\EventStaffController::class, 'saveEntrance']);
+    Route::put('/entrances/{entrance}', [\App\Http\Controllers\Api\EventStaffController::class, 'saveEntrance']);
+    Route::get('/staff', [\App\Http\Controllers\Api\EventStaffController::class, 'staff']);
+    Route::post('/staff/invitations', [\App\Http\Controllers\Api\EventStaffController::class, 'invite'])->middleware('throttle:10,1');
+    Route::delete('/staff/invitations/{invitation}', [\App\Http\Controllers\Api\EventStaffController::class, 'revokeInvitation']);
+    Route::delete('/staff/{member}', [\App\Http\Controllers\Api\EventStaffController::class, 'revoke']);
+    Route::get('/attendees', [\App\Http\Controllers\Api\EventOperationsController::class, 'attendees']);
+    Route::get('/attendees/export', [\App\Http\Controllers\Api\EventOperationsController::class, 'export']);
+    Route::patch('/attendees/{attendee}', [\App\Http\Controllers\Api\EventOperationsController::class, 'update']);
+    Route::get('/purchases', [\App\Http\Controllers\Api\EventOperationsController::class, 'purchases']);
+    Route::post('/tickets/{ticket}/resend', [\App\Http\Controllers\Api\EventOperationsController::class, 'resend'])->middleware('throttle:10,1');
+});
+Route::post('/event-staff/invitations/accept', [\App\Http\Controllers\Api\EventStaffController::class, 'accept'])->middleware(['auth:sanctum', 'throttle:10,1']);
+
+Route::get('/events/{event}/registration', [\App\Http\Controllers\Api\EventOperationsController::class, 'registrationForm']);
+
+Route::middleware(['auth:sanctum', 'throttle:dashboard-write'])->prefix('event-operations/{event}')->group(function () {
+    Route::get('/discounts', [\App\Http\Controllers\Api\EventDiscountController::class, 'index']);
+    Route::post('/discounts', [\App\Http\Controllers\Api\EventDiscountController::class, 'save']);
+    Route::put('/discounts/{discount}', [\App\Http\Controllers\Api\EventDiscountController::class, 'save']);
+});
+
+Route::middleware(['auth:sanctum', 'throttle:dashboard-write'])->prefix('event-operations/{event}')->group(function () {
+    Route::get('/messages', [\App\Http\Controllers\Api\EventMessageController::class, 'index']);
+    Route::post('/messages', [\App\Http\Controllers\Api\EventMessageController::class, 'save']);
+    Route::put('/messages/{message}', [\App\Http\Controllers\Api\EventMessageController::class, 'save']);
+    Route::post('/messages/{message}/send', [\App\Http\Controllers\Api\EventMessageController::class, 'send']);
+    Route::post('/messages/{message}/retry', [\App\Http\Controllers\Api\EventMessageController::class, 'retry']);
+});
+Route::put('/checkout/orders/{publicId}/message-preferences', [\App\Http\Controllers\Api\EventMessageController::class, 'preference'])->middleware('throttle:10,1');
+Route::match(['get', 'post'], '/event-message-preferences/{delivery}/unsubscribe', [\App\Http\Controllers\Api\EventMessageController::class, 'unsubscribe'])->middleware(['signed', 'throttle:10,1'])->name('event-message-unsubscribe');
+
+Route::post('/checkout/orders/{publicId}/cancel', [CheckoutController::class, 'cancel'])->middleware('throttle:10,1');
+Route::post('/event-operations/{event}/messages/audience', [\App\Http\Controllers\Api\EventMessageController::class, 'audience'])->middleware(['auth:sanctum', 'throttle:dashboard-read']);
+
+Route::middleware(['auth:sanctum', 'throttle:dashboard-write'])->prefix('event-operations/{event}')->group(function () {
+    Route::post('/lifecycle', [\App\Http\Controllers\Api\EventFinanceController::class, 'lifecycle']);
+    Route::get('/earnings', [\App\Http\Controllers\Api\EventFinanceController::class, 'earnings']);
+    Route::get('/refunds', [\App\Http\Controllers\Api\EventFinanceController::class, 'refunds']);
+    Route::post('/orders/{publicId}/refunds', [\App\Http\Controllers\Api\EventFinanceController::class, 'refund']);
+    Route::post('/refunds/{refund}/retry', [\App\Http\Controllers\Api\EventFinanceController::class, 'retry']);
+    Route::get('/financial-audit', [\App\Http\Controllers\Api\EventFinanceController::class, 'audits']);
+});
+Route::middleware(['auth:sanctum', 'throttle:5,1'])->prefix('seller')->group(function () {
+    Route::get('/banks', [\App\Http\Controllers\Api\PayoutAccountController::class, 'banks']);
+    Route::get('/payout-accounts', [\App\Http\Controllers\Api\PayoutAccountController::class, 'index']);
+    Route::post('/payout-accounts', [\App\Http\Controllers\Api\PayoutAccountController::class, 'store']);
+});

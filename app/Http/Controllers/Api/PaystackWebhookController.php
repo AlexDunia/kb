@@ -18,6 +18,7 @@ class PaystackWebhookController extends Controller
             return response()->json(['ok' => false], $secret === '' ? 500 : 401);
         }
         $data = $request->json()->all();
+        app(\App\Services\Commerce\FinancialWebhookService::class)->record($data);
         $reference = $data['data']['reference'] ?? null;
         if (($data['event'] ?? '') === 'charge.success' && is_string($reference)) {
             $payment = Payment::where('reference', $reference)->first();

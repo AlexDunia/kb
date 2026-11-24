@@ -6,6 +6,39 @@ use InvalidArgumentException;
 
 final class Money
 {
+    /** Exact floor(amount * weight / total), without overflowing the intermediate product. */
+    public static function proportional(int $amount, int $weight, int $total): int
+    {
+        if ($amount < 0 || $weight < 0 || $total <= 0 || $weight > $total || $total > intdiv(PHP_INT_MAX, 2)) {
+            throw new InvalidArgumentException('Invalid allocation weights.');
+        }
+        $whole = intdiv($amount, $total);
+        $remainder = $amount % $total;
+        $result = 0;
+        $carry = 0;
+        while ($weight > 0) {
+            if ($weight % 2) {
+                $result += $whole;
+                $carry += $remainder;
+                if ($carry >= $total) {
+                    $result++;
+                    $carry -= $total;
+                }
+            }
+            $weight = intdiv($weight, 2);
+            if ($weight) {
+                $whole *= 2;
+                $remainder *= 2;
+                if ($remainder >= $total) {
+                    $whole++;
+                    $remainder -= $total;
+                }
+            }
+        }
+
+        return $result;
+    }
+
     public static function decimalToMinor(string|int|float $value): int
     {
         $value = trim((string) $value);

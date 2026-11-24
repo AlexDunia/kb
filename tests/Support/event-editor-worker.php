@@ -14,6 +14,17 @@ try {
     if ($action === 'edit') {
         $event = app(App\Services\CreateEventService::class)->saveEvent($payload, (int) $ownerId, (int) $eventId);
         $result = ['status' => 200, 'version' => $event->lock_version];
+    } elseif ($action === 'refund') {
+        app(App\Services\Commerce\RefundService::class)->request(App\Models\Event::findOrFail($eventId), (int) $ownerId, App\Models\Order::findOrFail($payload['order_id']), $payload['item_ids'], $payload['key'], 'Buyer refund');
+        $result = ['status' => 202];
+    } elseif ($action === 'lifecycle') {
+        app(App\Services\EventLifecycleService::class)->change(App\Models\Event::findOrFail($eventId), (int) $ownerId, $payload);
+        $result = ['status' => 200];
+    } elseif ($action === 'scan') {
+        $result = ['status' => 200, 'data' => app(App\Services\AdmissionService::class)->move(App\Models\Event::findOrFail($eventId), (int) $ownerId, $payload)];
+    } elseif ($action === 'free-register') {
+        app(App\Services\Commerce\FreeRegistrationService::class)->register((int) $eventId, $payload, null);
+        $result = ['status' => 201];
     } elseif ($action === 'finalize') {
         app(App\Services\Commerce\PaymentFinalizer::class)->finalizePaystack($payload['reference'], $payload);
         $result = ['status' => 200];

@@ -16,8 +16,8 @@ class InventoryService
         $rows = DB::table('order_items')->join('orders', 'orders.id', '=', 'order_items.order_id')
             ->whereIn('order_items.ticket_type_id', $ids)
             ->when($exclude !== null, fn ($q) => $q->where('orders.id', '!=', $exclude))
-            ->where(fn ($q) => $q->where('orders.status', Order::STATUS_PAID)->orWhere(fn ($q) => $q->where('orders.status', Order::STATUS_PENDING_PAYMENT)->where('orders.expires_at', '>', now())))
-            ->selectRaw("order_items.ticket_type_id, SUM(CASE WHEN orders.status = 'paid' THEN order_items.quantity ELSE 0 END) sold_units, SUM(CASE WHEN orders.status = 'pending_payment' THEN order_items.quantity ELSE 0 END) reserved_units")
+            ->where(fn ($q) => $q->whereIn('orders.status', [Order::STATUS_PAID, 'registered', 'partially_refunded'])->orWhere(fn ($q) => $q->where('orders.status', Order::STATUS_PENDING_PAYMENT)->where('orders.expires_at', '>', now())))
+            ->selectRaw("order_items.ticket_type_id, SUM(CASE WHEN orders.status IN ('paid', 'registered', 'partially_refunded') THEN order_items.quantity - order_items.refunded_quantity ELSE 0 END) sold_units, SUM(CASE WHEN orders.status = 'pending_payment' THEN order_items.quantity ELSE 0 END) reserved_units")
             ->groupBy('order_items.ticket_type_id')->get();
         $result = [];
         foreach ($rows as $row) {

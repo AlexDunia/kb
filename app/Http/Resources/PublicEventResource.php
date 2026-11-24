@@ -13,8 +13,11 @@ class PublicEventResource extends JsonResource
             'id', 'title', 'description', 'category_id', 'date', 'ends_at',
             'event_timezone', 'event_type', 'event_format', 'price', 'total_tickets',
             'duration', 'featured', 'main_image', 'banner_image', 'banner_url',
-            'status', 'ticket_mode', 'tags', 'organiser_website', 'created_by',
+            'status', 'lifecycle_state', 'booking_cutoff_at', 'ticket_mode', 'tags', 'organiser_website', 'created_by',
         ]);
+
+        $data['registration_fields'] = app(\App\Services\Commerce\RegistrationService::class)->schema($this->resource);
+        $data['booking_supported'] = $this->resource->event_type !== 'recurring' && $this->resource->bookingsOpen();
 
         // Only these existing editor details are used as public programme content.
         $details = json_decode($this->resource->getAttribute('extra_details') ?? '[]', true);
