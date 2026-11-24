@@ -29,6 +29,7 @@ class TicketType extends Model
 
     protected $casts = [
         'price' => 'decimal:2',
+        'retired_at' => 'datetime',
         'quantity' => 'integer',
         'people_per_unit' => 'integer',
         'max_per_person' => 'integer',

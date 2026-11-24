@@ -31,30 +31,29 @@ class AppServiceProvider extends ServiceProvider
                 );
 
                 return $frontendUrl
-                    . '/reset-password?'
-                    . http_build_query([
+                    .'/reset-password?'
+                    .http_build_query([
                         'token' => $token,
-                        'email' =>
-                            $notifiable->getEmailForPasswordReset(),
+                        'email' => $notifiable->getEmailForPasswordReset(),
                     ]);
             }
         );
 
+        RateLimiter::for('login', fn (Request $request) => Limit::perMinute(10)->by(Str::lower((string) $request->input('email')).'|'.$request->ip()));
+
         RateLimiter::for(
             'api',
-            fn (Request $request) =>
-                Limit::perMinute(60)->by(
-                    $request->user()?->id
-                    ?? $request->ip()
-                )
+            fn (Request $request) => Limit::perMinute(60)->by(
+                $request->user()?->id
+                ?? $request->ip()
+            )
         );
 
         RateLimiter::for(
             'checkout-quote',
-            fn (Request $request) =>
-                Limit::perMinute(60)->by(
-                    $request->ip()
-                )
+            fn (Request $request) => Limit::perMinute(60)->by(
+                $request->ip()
+            )
         );
 
         RateLimiter::for(
@@ -72,7 +71,7 @@ class AppServiceProvider extends ServiceProvider
                         $request->ip()
                     ),
                     Limit::perMinute(8)->by(
-                        $email . '|' . $request->ip()
+                        $email.'|'.$request->ip()
                     ),
                 ];
             }
@@ -80,46 +79,41 @@ class AppServiceProvider extends ServiceProvider
 
         RateLimiter::for(
             'checkout-verify',
-            fn (Request $request) =>
-                Limit::perMinute(30)->by(
-                    $request->ip()
-                )
+            fn (Request $request) => Limit::perMinute(30)->by(
+                $request->ip()
+            )
         );
 
         RateLimiter::for(
             'paystack-webhook',
-            fn (Request $request) =>
-                Limit::perMinute(600)->by(
-                    $request->ip()
-                )
+            fn (Request $request) => Limit::perMinute(600)->by(
+                $request->ip()
+            )
         );
 
         // Public, low-impact analytics write. It is deliberately IP-limited
         // and also deduplicated server-side by event + visitor + hour.
         RateLimiter::for(
             'event-view',
-            fn (Request $request) =>
-                Limit::perMinute(120)->by(
-                    $request->ip()
-                )
+            fn (Request $request) => Limit::perMinute(120)->by(
+                $request->ip()
+            )
         );
 
         RateLimiter::for(
             'dashboard-read',
-            fn (Request $request) =>
-                Limit::perMinute(120)->by(
-                    $request->user()?->id
-                    ?? $request->ip()
-                )
+            fn (Request $request) => Limit::perMinute(120)->by(
+                $request->user()?->id
+                ?? $request->ip()
+            )
         );
 
         RateLimiter::for(
             'dashboard-write',
-            fn (Request $request) =>
-                Limit::perMinute(20)->by(
-                    $request->user()?->id
-                    ?? $request->ip()
-                )
+            fn (Request $request) => Limit::perMinute(20)->by(
+                $request->user()?->id
+                ?? $request->ip()
+            )
         );
     }
 }

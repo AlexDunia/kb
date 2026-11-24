@@ -12,7 +12,6 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
-use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
 class DashboardAnalyticsTest extends TestCase
@@ -48,7 +47,7 @@ class DashboardAnalyticsTest extends TestCase
         [$ownedEvent] = $this->paidEvent($owner, 'Owned Event');
         [$foreignEvent] = $this->paidEvent($other, 'Private Event');
 
-        Sanctum::actingAs($owner);
+        $this->actingAs($owner);
 
         $this->getJson('/api/dashboard/events')
             ->assertOk()
@@ -84,7 +83,7 @@ class DashboardAnalyticsTest extends TestCase
             Carbon::parse('2026-09-23 18:00:00', 'UTC')
         );
 
-        Sanctum::actingAs($owner);
+        $this->actingAs($owner);
 
         $response = $this->getJson(
             "/api/dashboard/events/{$eventId}/overview"
@@ -108,7 +107,7 @@ class DashboardAnalyticsTest extends TestCase
             'Attributed Event'
         );
 
-        Sanctum::actingAs($owner);
+        $this->actingAs($owner);
 
         $this->getJson(
             "/api/dashboard/events/{$eventId}/share-links"
@@ -145,10 +144,8 @@ class DashboardAnalyticsTest extends TestCase
                 return Http::response([
                     'status' => true,
                     'data' => [
-                        'authorization_url' =>
-                            'https://checkout.paystack.test/' . $reference,
-                        'access_code' =>
-                            'access_' . $reference,
+                        'authorization_url' => 'https://checkout.paystack.test/'.$reference,
+                        'access_code' => 'access_'.$reference,
                         'reference' => $reference,
                     ],
                 ]);
@@ -289,7 +286,7 @@ class DashboardAnalyticsTest extends TestCase
             ->where('event_id', $eventId)
             ->update(['source_code' => 'wa']);
 
-        Sanctum::actingAs($owner);
+        $this->actingAs($owner);
 
         $response = $this->getJson(
             "/api/dashboard/events/{$eventId}/overview"
@@ -309,7 +306,7 @@ class DashboardAnalyticsTest extends TestCase
             ->assertJsonPath('data.traffic.page_views', 2)
             ->assertJsonPath('data.traffic.unique_visitors', 2)
             ->assertJsonPath('data.traffic.converted_visitors', 1)
-            ->assertJsonPath('data.traffic.conversion_percent', 50.0);
+            ->assertJsonPath('data.traffic.conversion_percent', fn ($value) => is_numeric($value) && (float) $value === 50.0);
     }
 
     public function test_custom_share_links_are_owner_only_and_codes_are_sanitized(): void
@@ -322,14 +319,14 @@ class DashboardAnalyticsTest extends TestCase
             'Share Event'
         );
 
-        Sanctum::actingAs($other);
+        $this->actingAs($other);
 
         $this->postJson(
             "/api/dashboard/events/{$eventId}/share-links",
             ['label' => 'Church Alumni Group']
         )->assertForbidden();
 
-        Sanctum::actingAs($owner);
+        $this->actingAs($owner);
 
         $response = $this->postJson(
             "/api/dashboard/events/{$eventId}/share-links",
@@ -341,8 +338,7 @@ class DashboardAnalyticsTest extends TestCase
 
         $this->assertTrue(
             $codes->contains(
-                fn ($code) =>
-                    is_string($code)
+                fn ($code) => is_string($code)
                     && str_starts_with(
                         $code,
                         'church-alumni-group'
@@ -361,14 +357,14 @@ class DashboardAnalyticsTest extends TestCase
     ): array {
         $categoryId = DB::table('categories')
             ->insertGetId([
-                'name' => 'Category ' . Str::ulid(),
+                'name' => 'Category '.Str::ulid(),
                 'created_at' => now(),
                 'updated_at' => now(),
             ]);
 
         $organizerId = DB::table('organizers')
             ->insertGetId([
-                'name' => 'Organizer ' . Str::ulid(),
+                'name' => 'Organizer '.Str::ulid(),
                 'email' => null,
                 'created_at' => now(),
                 'updated_at' => now(),

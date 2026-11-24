@@ -182,10 +182,8 @@ class CheckoutService
                             OrderItem::query()->create([
                                 'order_id' => $order->id,
                                 ...$line,
-                                'source_code' =>
-                                    $touch['source_code'] ?? null,
-                                'attributed_event_view_id' =>
-                                    $touch['view_id'] ?? null,
+                                'source_code' => $touch['source_code'] ?? null,
+                                'attributed_event_view_id' => $touch['view_id'] ?? null,
                                 'currency' => $quote['currency'],
                             ]);
                         }
@@ -293,8 +291,7 @@ class CheckoutService
                                     fn ($ticket) => [
                                         'public_id' => $ticket->public_id,
                                         'token' => $ticket->token,
-                                        'admit_count' =>
-                                            (int) $ticket->admit_count,
+                                        'admit_count' => (int) $ticket->admit_count,
                                         'status' => $ticket->status,
                                     ]
                                 )
@@ -319,8 +316,7 @@ class CheckoutService
                     'reference' => $payment->reference,
                     'status' => $payment->status,
                     'access_code' => $payment->access_code,
-                    'authorization_url' =>
-                        $payment->authorization_url,
+                    'authorization_url' => $payment->authorization_url,
                 ]
                 : null,
         ];
@@ -370,9 +366,22 @@ class CheckoutService
             ->first();
 
         if ($order->status === Order::STATUS_PAYMENT_FAILED) {
-            $order->update([
-                'status' => Order::STATUS_PENDING_PAYMENT,
-            ]);
+            $items = $order->items()->orderBy('ticket_type_id')->get(['ticket_type_id', 'quantity'])->toArray();
+            $order = DB::transaction(function () use ($order, $items) {
+                $locked = Order::whereKey($order->id)->lockForUpdate()->firstOrFail();
+                $ids = array_column($items, 'ticket_type_id');
+                $types = TicketType::whereIn('id', $ids)->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+                if ($locked->status === Order::STATUS_PAYMENT_FAILED) {
+                    $types->load('event');
+                    $this->buildQuote($items, $types, $this->inventory->reservedQuantities($ids, $locked->id));
+                    $locked->update(['status' => Order::STATUS_PENDING_PAYMENT]);
+                }
+
+                return $locked;
+            }, 3);
+            if ($order->status !== Order::STATUS_PENDING_PAYMENT) {
+                return $this->payload($order, $order->payments()->latest('id')->first());
+            }
         }
 
         if (
@@ -452,7 +461,7 @@ class CheckoutService
         return Payment::query()->create([
             'order_id' => $order->id,
             'provider' => 'paystack',
-            'reference' => 'KT-' . Str::ulid(),
+            'reference' => 'KT-'.Str::ulid(),
             'amount_minor' => (int) $order->total_minor,
             'currency' => $order->currency,
             'status' => Payment::STATUS_CREATED,
@@ -480,8 +489,7 @@ class CheckoutService
                     )
                 )
                 ->groupBy('seller_user_id')
-                ->get()
-            as $group
+                ->get() as $group
         ) {
             $gross = (int) $group->gross_minor;
             $fee = intdiv(
@@ -503,8 +511,7 @@ class CheckoutService
                 'order_id' => $order->id,
                 'seller_user_id' => $group->seller_user_id,
                 'payout_account_id' => $payout?->id,
-                'provider_subaccount_code' =>
-                    $payout?->provider_subaccount_code,
+                'provider_subaccount_code' => $payout?->provider_subaccount_code,
                 'gross_minor' => $gross,
                 'platform_fee_minor' => $fee,
                 'seller_net_minor' => max(
@@ -538,11 +545,14 @@ class CheckoutService
                 || $type->event->status !== 'active'
                 || $type->event->ticket_mode !== 'paid'
                 || ! $type->visible
+                || $type->retired_at !== null
+                || ($type->event->ends_at && $type->event->ends_at->lte(now()))
                 || $type->event->created_by === null
             ) {
                 $errors["items.{$index}"] = [
                     'This ticket type is not currently available.',
                 ];
+
                 continue;
             }
 
@@ -555,6 +565,7 @@ class CheckoutService
                 $errors["items.{$index}"] = [
                     'Ticket sales are not currently available.',
                 ];
+
                 continue;
             }
 
@@ -573,6 +584,7 @@ class CheckoutService
                 $errors["items.{$index}"] = [
                     'Ticket quantity is unavailable.',
                 ];
+
                 continue;
             }
 
@@ -582,6 +594,7 @@ class CheckoutService
                 $errors["items.{$index}"] = [
                     'Free tickets are not handled by paid checkout.',
                 ];
+
                 continue;
             }
 
@@ -644,10 +657,8 @@ class CheckoutService
         return collect($items)
             ->map(
                 fn (array $item) => [
-                    'ticket_type_id' =>
-                        (int) $item['ticket_type_id'],
-                    'quantity' =>
-                        (int) $item['quantity'],
+                    'ticket_type_id' => (int) $item['ticket_type_id'],
+                    'quantity' => (int) $item['quantity'],
                 ]
             )
             ->sortBy('ticket_type_id')

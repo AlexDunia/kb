@@ -75,14 +75,12 @@ class DashboardAnalyticsService
         }
 
         $admissionCapacity = collect($ticketPerformance)->sum(
-            fn (array $tier) =>
-                (int) $tier['effective_capacity_units']
+            fn (array $tier) => (int) $tier['effective_capacity_units']
                 * max(1, (int) $tier['people_per_unit'])
         );
 
         $admissionEntriesCovered = collect($ticketPerformance)->sum(
-            fn (array $tier) =>
-                (int) $tier['sold_units']
+            fn (array $tier) => (int) $tier['sold_units']
                 * max(1, (int) $tier['people_per_unit'])
         );
 
@@ -103,8 +101,7 @@ class DashboardAnalyticsService
                 'available_units' => $availableUnits,
                 'sold_percent' => $this->percent($soldUnits, $salesCapacity),
                 'this_week_units' => (int) $timeline['this_week_units'],
-                'previous_comparable_units' =>
-                    (int) $timeline['previous_comparable_units'],
+                'previous_comparable_units' => (int) $timeline['previous_comparable_units'],
                 'week_growth_percent' => $this->growthPercent(
                     (int) $timeline['this_week_units'],
                     (int) $timeline['previous_comparable_units']
@@ -118,15 +115,13 @@ class DashboardAnalyticsService
                 // not for saying how many ticket products were sold.
                 'admission_capacity' => $admissionCapacity,
                 'admission_entries_covered' => $admissionEntriesCovered,
-                'tracking_supported' =>
-                    ($event->ticket_mode ?? 'free') === 'paid',
+                'tracking_supported' => ($event->ticket_mode ?? 'free') === 'paid',
             ],
             'revenue' => [
                 'currency' => strtoupper((string) config('commerce.currency', 'NGN')),
                 'total_minor' => (int) $timeline['total_revenue_minor'],
                 'this_week_minor' => (int) $timeline['this_week_revenue_minor'],
-                'previous_comparable_minor' =>
-                    (int) $timeline['previous_comparable_revenue_minor'],
+                'previous_comparable_minor' => (int) $timeline['previous_comparable_revenue_minor'],
                 'week_growth_percent' => $this->growthPercent(
                     (int) $timeline['this_week_revenue_minor'],
                     (int) $timeline['previous_comparable_revenue_minor']
@@ -172,10 +167,8 @@ class DashboardAnalyticsService
                     'views' => (int) ($stats['views'] ?? 0),
                     'unique_visitors' => (int) ($stats['unique_visitors'] ?? 0),
                     'buyers' => (int) ($stats['buyers'] ?? 0),
-                    'buyer_share_percent' =>
-                        (float) ($stats['buyer_share_percent'] ?? 0),
-                    'conversion_percent' =>
-                        (float) ($stats['conversion_percent'] ?? 0),
+                    'buyer_share_percent' => (float) ($stats['buyer_share_percent'] ?? 0),
+                    'conversion_percent' => (float) ($stats['conversion_percent'] ?? 0),
                     'units_sold' => (int) ($stats['units_sold'] ?? 0),
                     'revenue_minor' => (int) ($stats['revenue_minor'] ?? 0),
                 ];
@@ -213,27 +206,14 @@ class DashboardAnalyticsService
             ->get()
             ->keyBy(fn ($row) => (int) $row->ticket_type_id);
 
-        $reserved = DB::table('order_items')
-            ->join('orders', 'orders.id', '=', 'order_items.order_id')
-            ->where('order_items.event_id', $event->id)
-            ->whereIn('order_items.ticket_type_id', $ids)
-            ->where('orders.status', Order::STATUS_PENDING_PAYMENT)
-            ->where('orders.expires_at', '>', now())
-            ->groupBy('order_items.ticket_type_id')
-            ->selectRaw(
-                'order_items.ticket_type_id,
-                 COALESCE(SUM(order_items.quantity), 0) AS reserved_units'
-            )
-            ->get()
-            ->keyBy(fn ($row) => (int) $row->ticket_type_id);
+        $commitments = app(\App\Services\Commerce\InventoryService::class)->commitments($ids);
 
         return $ticketTypes
-            ->map(function ($type) use ($paid, $reserved) {
+            ->map(function ($type) use ($paid, $commitments) {
                 $sale = $paid->get((int) $type->id);
-                $hold = $reserved->get((int) $type->id);
 
-                $sold = (int) ($sale->sold_units ?? 0);
-                $reservedUnits = (int) ($hold->reserved_units ?? 0);
+                $sold = (int) ($commitments[$type->id]['sold_units'] ?? 0);
+                $reservedUnits = (int) ($commitments[$type->id]['reserved_units'] ?? 0);
                 $configuredCapacity = max(0, (int) $type->quantity);
 
                 // A hidden tier with history is preserved by CreateEventService.
@@ -241,7 +221,7 @@ class DashboardAnalyticsService
                 // dashboard denominator becomes the number already sold.
                 $effectiveCapacity = $type->visible
                     ? max($configuredCapacity, $sold)
-                    : $sold;
+                    : $sold + $reservedUnits;
 
                 return [
                     'id' => (int) $type->id,
@@ -403,8 +383,7 @@ class DashboardAnalyticsService
             'series_all' => $seriesAll,
             'best_this_week' => $this->bestDay(
                 collect($daily)->filter(
-                    fn (array $day) =>
-                        $day['date'] >= $currentWeekStart->format('Y-m-d')
+                    fn (array $day) => $day['date'] >= $currentWeekStart->format('Y-m-d')
                         && $day['date'] <= $now->format('Y-m-d')
                 ),
                 $timezone
@@ -765,6 +744,7 @@ class DashboardAnalyticsService
             if ($best === null) {
                 $bestKey = $key;
                 $best = $bucket;
+
                 continue;
             }
 
@@ -872,7 +852,7 @@ class DashboardAnalyticsService
     {
         $slug = Str::slug((string) $event->title);
 
-        return '/events/' . $event->id . '-' . $slug;
+        return '/events/'.$event->id.'-'.$slug;
     }
 
     private function percent(int $numerator, int $denominator): float

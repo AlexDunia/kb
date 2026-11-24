@@ -11,7 +11,7 @@ class EventMedia extends Model
 
     protected $fillable = ['event_id', 'source_type', 'url', 'is_cover', 'sort_order'];
 
-    protected $casts = ['is_cover' => 'boolean'];
+    protected $casts = ['is_cover' => 'boolean', 'sort_order' => 'integer'];
 
     public function event(): BelongsTo
     {

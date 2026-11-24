@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -41,6 +42,8 @@ class Event extends Model
      */
     protected $casts = [
         'date' => 'datetime',
+        'ends_at' => 'datetime',
+        'lock_version' => 'integer',
         'price' => 'decimal:2',
         'featured' => 'boolean',
     ];
@@ -112,5 +115,15 @@ class Event extends Model
     public function eventOptions(): BelongsToMany
     {
         return $this->belongsToMany(EventOption::class);
+    }
+
+    public function scopePubliclyVisible(Builder $query): Builder
+    {
+        return $query->where('events.status', 'active');
+    }
+
+    public function publicProfile(): \Illuminate\Database\Eloquent\Relations\HasOne
+    {
+        return $this->hasOne(EventPublicProfile::class);
     }
 }

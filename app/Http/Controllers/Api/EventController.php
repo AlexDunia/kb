@@ -3,416 +3,158 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Resources\PublicEventResource;
 use App\Models\Event;
-use App\Models\OrderItem;
-use App\Models\Organizer;
-use App\Models\EventAddress;
-use App\Models\TicketType;
-use App\Models\Faq;
-use App\Models\EventOption;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
-use Voku\Helper\AntiXSS;
 
 class EventController extends Controller
 {
     /**
      * Get a listing of events with optional filtering
      */
-   public function index(Request $request)
-{
-    $query = Event::with(['category', 'organizer', 'address', 'subCategories']);
-
-    // Apply filters if provided
-    if ($request->has('category_id')) {
-        $query->where('category_id', $request->category_id);
-    }
-
-    if ($request->has('subcategory_id')) {
-        $query->whereHas('subCategories', function($q) use ($request) {
-            $q->where('sub_categories.id', $request->subcategory_id);
-        });
-    }
-
-    if ($request->has('date_from')) {
-        $query->where('date', '>=', $request->date_from);
-    }
-
-    if ($request->has('date_to')) {
-        $query->where('date', '<=', $request->date_to);
-    }
-
-    if ($request->has('featured') && $request->featured) {
-        $query->where('featured', true);
-    }
-
-    // Sort options - DEFAULT TO LATEST FIRST
-    if ($request->has('sort')) {
-        switch ($request->sort) {
-            case 'date-asc':
-                $query->orderBy('date', 'asc');
-                break;
-            case 'date-desc':
-                $query->orderBy('date', 'desc');
-                break;
-            case 'price-asc':
-                $query->orderBy('price', 'asc');
-                break;
-            case 'price-desc':
-                $query->orderBy('price', 'desc');
-                break;
-            default:
-                $query->latest(); // Show newest first
-                break;
+    public function index(Request $request)
+    {
+        $request->validate([
+            'per_page' => 'sometimes|integer|min:1|max:100', 'page' => 'sometimes|integer|min:1',
+            'category_id' => 'sometimes|integer|exists:categories,id', 'subcategory_id' => 'sometimes|integer|exists:sub_categories,id',
+            'category' => 'sometimes|string|max:100', 'q' => ['sometimes', 'nullable', 'string', 'max:200', function ($attribute, $value, $fail) {
+                if (is_string($value) && count(preg_split('/\s+/u', trim($value), -1, PREG_SPLIT_NO_EMPTY)) > 20) {
+                    $fail('Search supports at most 20 words.');
+                }
+            }], 'city' => 'sometimes|nullable|string|max:255',
+            'date_from' => 'sometimes|date', 'date_to' => $request->filled('date_from') ? 'sometimes|date|after_or_equal:date_from' : 'sometimes|date',
+            'sort' => 'sometimes|in:date-asc,date-desc,price-asc,price-desc,latest', 'featured' => 'sometimes|boolean',
+        ]);
+        $query = Event::publiclyVisible()->with(['category', 'organizer', 'address', 'subCategories']);
+        if ($request->filled('city')) {
+            $query->whereHas('address', fn ($address) => $address->where('city_search', mb_strtolower(trim($request->city))));
         }
-    } else {
-        $query->latest(); // Show newest first by default
+        if ($request->filled('category')) {
+            $query->whereHas('category', fn ($category) => $category->where('name', $request->category));
+        }
+        $words = preg_split('/\s+/u', mb_strtolower(trim((string) $request->input('q', ''))), -1, PREG_SPLIT_NO_EMPTY);
+        foreach (array_slice($words, 0, 20) as $word) {
+            $pattern = '%'.str_replace(['!', '%', '_'], ['!!', '!%', '!_'], $word).'%';
+            $query->where(function ($search) use ($pattern) {
+                foreach (['title', 'description', 'tags'] as $field) {
+                    $search->orWhereRaw("LOWER(events.$field) LIKE ? ESCAPE '!'", [$pattern]);
+                }
+                $search->orWhereHas('organizer', fn ($organizer) => $organizer->whereRaw("LOWER(name) LIKE ? ESCAPE '!'", [$pattern]));
+                $search->orWhereHas('category', fn ($category) => $category->whereRaw("LOWER(name) LIKE ? ESCAPE '!'", [$pattern]));
+                $search->orWhereHas('address', fn ($address) => $address->whereRaw("LOWER(venue_name) LIKE ? ESCAPE '!'", [$pattern])->orWhereRaw("LOWER(city) LIKE ? ESCAPE '!'", [$pattern]));
+            });
+        }
+
+        // Apply filters if provided
+        if ($request->has('category_id')) {
+            $query->where('category_id', $request->category_id);
+        }
+
+        if ($request->has('subcategory_id')) {
+            $query->whereHas('subCategories', function ($q) use ($request) {
+                $q->where('sub_categories.id', $request->subcategory_id);
+            });
+        }
+
+        if ($request->has('date_from')) {
+            $query->where('date', '>=', $request->date_from);
+        }
+
+        if ($request->has('date_to')) {
+            $query->where('date', '<=', $request->date_to);
+        }
+
+        if ($request->has('featured') && $request->featured) {
+            $query->where('featured', true);
+        }
+
+        // Sort options - DEFAULT TO LATEST FIRST
+        if ($request->has('sort')) {
+            switch ($request->sort) {
+                case 'date-asc':
+                    $query->orderBy('date', 'asc');
+                    break;
+                case 'date-desc':
+                    $query->orderBy('date', 'desc');
+                    break;
+                case 'price-asc':
+                    $query->orderBy('price', 'asc');
+                    break;
+                case 'price-desc':
+                    $query->orderBy('price', 'desc');
+                    break;
+                default:
+                    $query->latest(); // Show newest first
+                    break;
+            }
+        } else {
+            $query->latest(); // Show newest first by default
+        }
+
+        $perPage = (int) $request->input('per_page', 10);
+
+        $events = $query->orderBy('id', in_array($request->input('sort'), ['date-asc', 'price-asc'], true) ? 'asc' : 'desc')->paginate($perPage);
+
+        return response()->json([
+            'data' => PublicEventResource::collection($events->getCollection())->resolve($request),
+            'meta' => [
+                'current_page' => $events->currentPage(),
+                'from' => $events->firstItem(),
+                'last_page' => $events->lastPage(),
+                'per_page' => $events->perPage(),
+                'to' => $events->lastItem(),
+                'total' => $events->total(),
+            ],
+            'links' => [
+                'first' => $events->url(1),
+                'last' => $events->url($events->lastPage()),
+                'prev' => $events->previousPageUrl(),
+                'next' => $events->nextPageUrl(),
+            ],
+        ]);
     }
-
-    // Pagination - FIX: Don't let page parameter break the query
-    $perPage = min($request->input('per_page', 10), 100); // Max 100 items
-
-    // âœ… ADD DEBUG LOG
-    \Log::info('Events query', [
-        'total_count' => Event::count(),
-        'query_count' => $query->count(),
-        'page' => $request->input('page', 1),
-        'per_page' => $perPage,
-        'filters' => $request->all()
-    ]);
-
-    $events = $query->paginate($perPage);
-
-    return response()->json([
-        'data' => $events->items(),
-        'meta' => [
-            'current_page' => $events->currentPage(),
-            'from' => $events->firstItem(),
-            'last_page' => $events->lastPage(),
-            'per_page' => $events->perPage(),
-            'to' => $events->lastItem(),
-            'total' => $events->total(),
-        ],
-        'links' => [
-            'first' => $events->url(1),
-            'last' => $events->url($events->lastPage()),
-            'prev' => $events->previousPageUrl(),
-            'next' => $events->nextPageUrl(),
-        ]
-    ]);
-}
 
     /**
      * Get the specified event with all related data
      */
     public function show(Event $event)
     {
+        abort_unless($event->status === 'active', 404);
         $event->load([
+            'publicProfile',
+            'media',
             'category',
             'organizer',
             'address',
             'subCategories',
             'ticketTypes' => function ($query) {
-                $query->where('visible', true);
+                $query->where('visible', true)->whereNull('retired_at');
             },
             'faqs',
-            'eventOptions'
+            'eventOptions',
         ]);
+
+        $this->attachInventory($event->ticketTypes);
+
+        $relatedIds = $event->publicProfile?->related_event_ids ?? [];
+        $event->setRelation('relatedEvents', Event::publiclyVisible()
+            ->with(['organizer', 'address'])
+            ->whereIn('id', $relatedIds)
+            ->where('id', '!=', $event->id)
+            ->get());
 
         return response()->json([
-            'data' => $event
+            'data' => (new PublicEventResource($event))->resolve(),
         ]);
     }
 
-    /**
-     * Store a newly created event in storage.
-     */
-    public function store(Request $request)
+    /** The editor is the sole supported event writer. */
+    public function retiredMutation()
     {
-        // Check authorization
-        if (!auth()->user()->hasAnyRole(['admin', 'agent'])) {
-            return response()->json(['error' => 'Unauthorized'], 403);
-        }
-
-        // Validate input
-        $validated = $request->validate([
-            'title' => 'required|string|min:5|max:100',
-            'description' => 'required|string|min:20|max:5000',
-            'category_id' => 'required|exists:categories,id',
-            'organizer.name' => 'required|string|min:5|max:100',
-            'organizer.email' => 'nullable|email|max:255',
-            'location.venue_name' => 'required|string|max:100',
-            'location.address_line1' => 'required|string|max:255',
-            'location.address_line2' => 'nullable|string|max:255',
-            'location.city' => 'required|string|max:100',
-            'location.state' => 'required|string|max:100',
-            'location.postal_code' => 'required|string|max:20',
-            'location.country' => 'required|string|max:100',
-            'date' => 'required|date|after:today',
-            'price' => 'required|numeric|min:0|max:100000',
-            'total_tickets' => 'required|integer|min:1|max:100000',
-            'duration' => 'nullable|string|max:50',
-            'featured' => 'boolean',
-            'main_image' => 'required|image|mimes:jpeg,png,gif|max:5120',
-            'banner_image' => 'required|image|mimes:jpeg,png,gif|max:5120',
-            'sub_categories' => 'array|max:5',
-            'sub_categories.*' => 'exists:sub_categories,id',
-            'ticket_types' => 'required|array|min:1',
-            'ticket_types.*.name' => 'required|string|max:50',
-            'ticket_types.*.price' => 'required|numeric|min:0',
-            'ticket_types.*.quantity' => 'required|integer|min:1',
-            'ticket_types.*.description' => 'nullable|string|max:1000',
-            'ticket_types.*.sales_end_date' => 'nullable|date|before_or_equal:date',
-            'ticket_types.*.is_featured' => 'boolean',
-            'faqs' => 'array',
-            'faqs.*.question' => 'nullable|string|max:255',
-            'faqs.*.answer' => 'nullable|string|max:1000',
-            'event_options' => 'array',
-            'event_options.*' => 'string|max:50',
-        ]);
-
-        try {
-            return DB::transaction(function () use ($request, $validated) {
-                // Store images
-                $mainImagePath = $request->file('main_image')->store('events/images', 'public');
-                $bannerImagePath = $request->file('banner_image')->store('events/images', 'public');
-
-                // Create organizer
-                $organizer = Organizer::create([
-                    'name' => $validated['organizer']['name'],
-                    'email' => $validated['organizer']['email'],
-                ]);
-
-                // Create address
-                $address = EventAddress::create($validated['location']);
-
-                // Create event
-                $event = Event::create([
-                    'title' => $validated['title'],
-                    'description' => $validated['description'],
-                    'category_id' => $validated['category_id'],
-                    'organizer_id' => $organizer->id,
-                    'address_id' => $address->id,
-                    'date' => $validated['date'],
-                    'price' => $validated['price'],
-                    'total_tickets' => $validated['total_tickets'],
-                    'duration' => $validated['duration'],
-                    'featured' => $validated['featured'] ?? false,
-                    'main_image' => $mainImagePath,
-                    'banner_image' => $bannerImagePath,
-                    'created_by' => auth()->id(),
-                ]);
-
-                // Attach subcategories
-                if (!empty($validated['sub_categories'])) {
-                    $event->subCategories()->sync($validated['sub_categories']);
-                }
-
-                // Create ticket types
-                foreach ($validated['ticket_types'] as $ticket) {
-                    TicketType::create([
-                        'event_id' => $event->id,
-                        'name' => $ticket['name'],
-                        'price' => $ticket['price'],
-                        'quantity' => $ticket['quantity'],
-                        'description' => $ticket['description'] ?? null,
-                        'sales_end_date' => $ticket['sales_end_date'] ?? null,
-                        'is_featured' => $ticket['is_featured'] ?? false,
-                    ]);
-                }
-
-                // Create FAQs
-                if (!empty($validated['faqs'])) {
-                    foreach ($validated['faqs'] as $faq) {
-                        if (!empty($faq['question']) && !empty($faq['answer'])) {
-                            Faq::create([
-                                'event_id' => $event->id,
-                                'question' => $faq['question'],
-                                'answer' => $faq['answer'],
-                            ]);
-                        }
-                    }
-                }
-
-                // Create or attach event options
-                if (!empty($validated['event_options'])) {
-                    foreach ($validated['event_options'] as $optionName) {
-                        $option = EventOption::firstOrCreate(
-                            ['name' => $optionName],
-                            ['is_custom' => true]
-                        );
-                        $event->eventOptions()->attach($option->id);
-                    }
-                }
-
-                // Return properly formatted response
-                return response()->json([
-                    'data' => [
-                        'id' => $event->id,
-                        'message' => 'Event created successfully'
-                    ]
-                ], 201);
-            });
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to create event',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * Update the specified event in storage.
-     */
-    public function update(Request $request, Event $event)
-    {
-        // Check authorization
-        if (!auth()->user()->hasAnyRole(['admin', 'agent']) && auth()->id() !== $event->created_by) {
-            return response()->json(['error' => 'Unauthorized'], 403);
-        }
-
-        // Validate input
-        $validated = $request->validate([
-            'title' => 'sometimes|required|string|min:5|max:100',
-            'description' => 'sometimes|required|string|min:20|max:5000',
-            'category_id' => 'sometimes|required|exists:categories,id',
-            'date' => 'sometimes|required|date',
-            'price' => 'sometimes|required|numeric|min:0|max:100000',
-            'total_tickets' => 'sometimes|required|integer|min:1|max:100000',
-            'duration' => 'nullable|string|max:50',
-            'featured' => 'sometimes|boolean',
-            'main_image' => 'sometimes|image|mimes:jpeg,png,gif|max:5120',
-            'banner_image' => 'sometimes|image|mimes:jpeg,png,gif|max:5120',
-            'sub_categories' => 'sometimes|array|max:5',
-            'sub_categories.*' => 'exists:sub_categories,id',
-        ]);
-
-        try {
-            return DB::transaction(function () use ($request, $validated, $event) {
-                // Update event attributes
-                if ($request->hasFile('main_image')) {
-                    // Delete old image if it exists
-                    if ($event->main_image) {
-                        Storage::disk('public')->delete($event->main_image);
-                    }
-                    $validated['main_image'] = $request->file('main_image')->store('events/images', 'public');
-                }
-
-                if ($request->hasFile('banner_image')) {
-                    // Delete old image if it exists
-                    if ($event->banner_image) {
-                        Storage::disk('public')->delete($event->banner_image);
-                    }
-                    $validated['banner_image'] = $request->file('banner_image')->store('events/images', 'public');
-                }
-
-                // Update event
-                $event->update($validated);
-
-                // Update subcategories if provided
-                if (isset($validated['sub_categories'])) {
-                    $event->subCategories()->sync($validated['sub_categories']);
-                }
-
-                // Load updated event with relations
-                $event->load([
-                    'category',
-                    'organizer',
-                    'address',
-                    'subCategories',
-                    'ticketTypes',
-                    'faqs',
-                    'eventOptions'
-                ]);
-
-                return response()->json([
-                    'data' => $event,
-                    'message' => 'Event updated successfully'
-                ]);
-            });
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to update event',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * Remove the specified event from storage.
-     */
-    public function destroy(Event $event)
-    {
-        // Check authorization
-        if (!auth()->user()->hasAnyRole(['admin']) && auth()->id() !== $event->created_by) {
-            return response()->json(['error' => 'Unauthorized'], 403);
-        }
-
-        if (
-            OrderItem::query()
-                ->where('event_id', $event->id)
-                ->exists()
-        ) {
-            return response()->json(
-                [
-                    'message' =>
-                        'Events with checkout history cannot be deleted. Hide or cancel the event instead.',
-                ],
-                422
-            );
-        }
-
-        try {
-            return DB::transaction(function () use ($event) {
-                // Delete related images
-                if ($event->main_image) {
-                    Storage::disk('public')->delete($event->main_image);
-                }
-                if ($event->banner_image) {
-                    Storage::disk('public')->delete($event->banner_image);
-                }
-
-                // Delete the event (cascade delete should handle relations)
-                $event->delete();
-
-                return response()->json([
-                    'data' => null,
-                    'message' => 'Event deleted successfully'
-                ]);
-            });
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to delete event',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * Track when a user views an event
-     */
-    public function trackView(Event $event)
-    {
-        try {
-            if (auth()->check()) {
-                \App\Models\EventView::trackView(
-                    auth()->id(),
-                    $event->id,
-                    request()->ip()
-                );
-            }
-
-            return response()->json(['success' => true], 200);
-        } catch (\Exception $e) {
-            \Log::warning('Failed to track event view', [
-                'event_id' => $event->id,
-                'user_id' => auth()->id(),
-                'error' => $e->getMessage()
-            ]);
-
-            return response()->json(['success' => false], 200);
-        }
+        return response()->json([
+            'message' => 'This legacy event mutation endpoint has been retired. Use the event editor endpoints.',
+            'editor_endpoint' => '/api/create-event',
+        ], 410);
     }
 
     /**
@@ -420,11 +162,12 @@ class EventController extends Controller
      */
     public function toggleLike(Event $event)
     {
+        abort_unless($event->status === 'active', 404);
         try {
-            if (!auth()->check()) {
+            if (! auth()->check()) {
                 return response()->json([
                     'error' => 'Unauthenticated',
-                    'message' => 'Please log in to like events'
+                    'message' => 'Please log in to like events',
                 ], 401);
             }
 
@@ -435,21 +178,21 @@ class EventController extends Controller
                 $engine->clearCache();
             }
 
-         return response()->json([
-    'liked' => $liked,
-    'likes_count' => \App\Models\EventLike::where('event_id', $event->id)->count(),
-    'message' => $liked ? 'Event liked' : 'Event unliked'
-], 200);
+            return response()->json([
+                'liked' => $liked,
+                'likes_count' => \App\Models\EventLike::where('event_id', $event->id)->count(),
+                'message' => $liked ? 'Event liked' : 'Event unliked',
+            ], 200);
 
         } catch (\Exception $e) {
             \Log::error('Failed to toggle event like', [
                 'event_id' => $event->id,
                 'user_id' => auth()->id(),
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
             ]);
 
             return response()->json([
-                'error' => 'Failed to toggle like'
+                'message' => 'Failed to toggle like. Please try again later.',
             ], 500);
         }
     }
@@ -457,37 +200,51 @@ class EventController extends Controller
     /**
      * Check if user has liked an event
      */
-   public function checkLiked(Event $event)
-{
-    if (!auth()->check()) {
-        return response()->json(['liked' => false, 'likes_count' => 0], 200);
+    public function checkLiked(Event $event)
+    {
+        abort_unless($event->status === 'active', 404);
+        if (! auth()->check()) {
+            return response()->json(['liked' => false, 'likes_count' => 0], 200);
+        }
+
+        $liked = \App\Models\EventLike::where('user_id', auth()->id())
+            ->where('event_id', $event->id)
+            ->exists();
+
+        $count = \App\Models\EventLike::where('event_id', $event->id)->count();
+
+        return response()->json(['liked' => $liked, 'likes_count' => $count], 200);
     }
 
-    $liked = \App\Models\EventLike::where('user_id', auth()->id())
-        ->where('event_id', $event->id)
-        ->exists();
-
-    $count = \App\Models\EventLike::where('event_id', $event->id)->count();
-
-    return response()->json(['liked' => $liked, 'likes_count' => $count], 200);
-}
-
-
-
     public function getLikedEvents(Request $request)
-{
-    $user = $request->user();
+    {
+        $user = $request->user();
 
-    $likedEventIds = \App\Models\EventLike::where('user_id', $user->id)
-        ->pluck('event_id');
+        $likedEventIds = \App\Models\EventLike::where('user_id', $user->id)->select('event_id');
 
-    $events = Event::whereIn('id', $likedEventIds)
-        ->with(['category', 'address', 'ticketTypes'])
-        ->latest()
-        ->get();
+        $events = Event::publiclyVisible()->whereIn('id', $likedEventIds)
+            ->with(['category', 'address', 'ticketTypes' => fn ($query) => $query->where('visible', true)->whereNull('retired_at')])
+            ->latest()
+            ->paginate(100);
 
-    return response()->json(['data' => $events]);
-}
+        $this->attachInventory($events->getCollection()->flatMap(fn ($event) => $event->ticketTypes));
 
+        return response()->json(['data' => PublicEventResource::collection($events->getCollection())->resolve($request), 'meta' => ['current_page' => $events->currentPage(), 'last_page' => $events->lastPage(), 'per_page' => $events->perPage(), 'total' => $events->total()]]);
+    }
 
+    private function attachInventory(\Illuminate\Support\Collection $tickets): void
+    {
+        $inventory = app(\App\Services\Commerce\InventoryService::class);
+        $commitments = $inventory->commitments($tickets->pluck('id')->all());
+        foreach ($tickets as $ticketType) {
+            $ticketType->setAttribute('sold_units', $commitments[$ticketType->id]['sold_units'] ?? 0);
+            $ticketType->setAttribute('reserved_units', $commitments[$ticketType->id]['reserved_units'] ?? 0);
+            $ticketType->setAttribute('configured_capacity_units', (int) $ticketType->quantity);
+            $ticketType->setAttribute('admission_capacity', (int) $ticketType->quantity * (int) $ticketType->people_per_unit);
+            $ticketType->setAttribute('available_quantity', $inventory->availableQuantity(
+                (int) $ticketType->quantity, (int) ($commitments[$ticketType->id]['sold_units'] ?? 0) + (int) ($commitments[$ticketType->id]['reserved_units'] ?? 0)
+            ));
+        }
+
+    }
 }

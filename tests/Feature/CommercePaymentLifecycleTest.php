@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+
 use App\Models\Order;
 use App\Models\Payment;
 use App\Models\User;
@@ -239,7 +240,7 @@ $transactionLevel = null;
 
         $token = (string) Str::uuid();
 
-        Sanctum::actingAs($buyer);
+        $this->actingAs($buyer, 'sanctum');
 
         $result = $this->postJson(
             '/api/checkout/initialize',
@@ -248,12 +249,12 @@ $transactionLevel = null;
 
         $publicId = $result->json('data.order.public_id');
 
-        Sanctum::actingAs($buyer);
+        $this->actingAs($buyer, 'sanctum');
 
         $this->getJson("/api/checkout/orders/{$publicId}")
             ->assertOk();
 
-        Sanctum::actingAs($other);
+        $this->actingAs($other, 'sanctum');
 
         $this->getJson("/api/checkout/orders/{$publicId}")
             ->assertForbidden();

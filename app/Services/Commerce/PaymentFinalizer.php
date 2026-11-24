@@ -20,9 +20,15 @@ class PaymentFinalizer
         string $reference,
         array $providerData
     ): Order {
+        // Order lines are immutable after initialization. Read their IDs before the
+        // transaction, so its first consistent read happens after inventory row locks.
+        $inventoryIds = \App\Models\OrderItem::where('order_id', Payment::where('reference', $reference)->value('order_id'))
+            ->orderBy('ticket_type_id')->pluck('ticket_type_id')->unique()->values()->all();
+
         return DB::transaction(function () use (
             $reference,
-            $providerData
+            $providerData,
+            $inventoryIds
         ) {
             $payment = Payment::query()
                 ->where('reference', $reference)
@@ -59,23 +65,19 @@ class PaymentFinalizer
                 ) {
                     $payment->update([
                         'status' => Payment::STATUS_FAILED,
-                        'provider_transaction_id' =>
-                            isset($providerData['id'])
+                        'provider_transaction_id' => isset($providerData['id'])
                                 ? (string) $providerData['id']
                                 : null,
-                        'channel' =>
-                            $providerData['channel'] ?? null,
-                        'gateway_response' =>
-                            $providerData['gateway_response']
+                        'channel' => $providerData['channel'] ?? null,
+                        'gateway_response' => $providerData['gateway_response']
                             ?? ucfirst($providerStatus),
                         'paid_at' => $providerData['paid_at'] ?? null,
                         'verified_at' => now(),
                     ]);
 
-                    if (!$order->isPaid()) {
+                    if (! $order->isPaid()) {
                         $order->update([
-                            'status' =>
-                                Order::STATUS_PAYMENT_FAILED,
+                            'status' => Order::STATUS_PAYMENT_FAILED,
                         ]);
                     }
                 }
@@ -102,29 +104,25 @@ class PaymentFinalizer
                 === strtoupper((string) $payment->currency);
 
             if (
-                !$referenceMatches
-                || !$amountMatches
-                || !$currencyMatches
+                ! $referenceMatches
+                || ! $amountMatches
+                || ! $currencyMatches
             ) {
                 $payment->update([
                     'status' => Payment::STATUS_REVIEW,
-                    'provider_transaction_id' =>
-                        isset($providerData['id'])
+                    'provider_transaction_id' => isset($providerData['id'])
                             ? (string) $providerData['id']
                             : null,
                     'channel' => $providerData['channel'] ?? null,
-                    'gateway_response' =>
-                        $providerData['gateway_response']
+                    'gateway_response' => $providerData['gateway_response']
                         ?? 'Verification mismatch',
-                    'paid_at' =>
-                        $providerData['paid_at'] ?? null,
+                    'paid_at' => $providerData['paid_at'] ?? null,
                     'verified_at' => now(),
                 ]);
 
-                if (!$order->isPaid()) {
+                if (! $order->isPaid()) {
                     $order->update([
-                        'status' =>
-                            Order::STATUS_PAYMENT_REVIEW,
+                        'status' => Order::STATUS_PAYMENT_REVIEW,
                     ]);
                 }
 
@@ -144,16 +142,13 @@ class PaymentFinalizer
             if ($order->isPaid()) {
                 $payment->update([
                     'status' => Payment::STATUS_REVIEW,
-                    'provider_transaction_id' =>
-                        isset($providerData['id'])
+                    'provider_transaction_id' => isset($providerData['id'])
                             ? (string) $providerData['id']
                             : null,
                     'channel' => $providerData['channel'] ?? null,
-                    'gateway_response' =>
-                        $providerData['gateway_response']
+                    'gateway_response' => $providerData['gateway_response']
                         ?? 'Additional successful payment',
-                    'paid_at' =>
-                        $providerData['paid_at'] ?? now(),
+                    'paid_at' => $providerData['paid_at'] ?? now(),
                     'verified_at' => now(),
                 ]);
 
@@ -164,31 +159,9 @@ class PaymentFinalizer
                 );
             }
 
-            $items = $order->items()
-                ->with('tickets')
-                ->orderBy('id')
-                ->get();
-
-            $ticketTypeIds = $items
-                ->pluck('ticket_type_id')
-                ->filter()
-                ->map(fn ($id) => (int) $id)
-                ->unique()
-                ->sort()
-                ->values()
-                ->all();
-
-            /*
-             * Lock every affected ticket type in a deterministic
-             * order before an inventory-sensitive finalization.
-             * This serializes competing late-payment finalizations.
-             */
-            $ticketTypes = TicketType::query()
-                ->whereIn('id', $ticketTypeIds)
-                ->orderBy('id')
-                ->lockForUpdate()
-                ->get()
-                ->keyBy('id');
+            $ticketTypes = TicketType::query()->whereIn('id', $inventoryIds)->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+            $ticketTypeIds = $inventoryIds;
+            $items = $order->items()->with('tickets')->orderBy('id')->get();
 
             $paidAt = isset($providerData['paid_at'])
                 && $providerData['paid_at']
@@ -196,7 +169,7 @@ class PaymentFinalizer
                 : now();
 
             $paidBeforeOrAtExpiry =
-                !$order->expires_at
+                ! $order->expires_at
                 || $paidAt->lte($order->expires_at);
 
             /*
@@ -210,7 +183,7 @@ class PaymentFinalizer
              * be fulfilled, put the payment/order into review and
              * issue no tickets.
              */
-            if (!$paidBeforeOrAtExpiry) {
+            if (! $paidBeforeOrAtExpiry || ! $order->isReservationActive()) {
                 $reserved = $this->inventory
                     ->reservedQuantities(
                         $ticketTypeIds,
@@ -222,7 +195,7 @@ class PaymentFinalizer
                         (int) $item->ticket_type_id
                     );
 
-                    if (!$ticketType) {
+                    if (! $ticketType) {
                         $this->moveToReview(
                             $payment,
                             $order,
@@ -268,13 +241,11 @@ class PaymentFinalizer
 
             $payment->update([
                 'status' => Payment::STATUS_SUCCESS,
-                'provider_transaction_id' =>
-                    isset($providerData['id'])
+                'provider_transaction_id' => isset($providerData['id'])
                         ? (string) $providerData['id']
                         : null,
                 'channel' => $providerData['channel'] ?? null,
-                'gateway_response' =>
-                    $providerData['gateway_response']
+                'gateway_response' => $providerData['gateway_response']
                     ?? 'Success',
                 'paid_at' => $paidAt,
                 'verified_at' => now(),
@@ -299,11 +270,9 @@ class PaymentFinalizer
                         'public_id' => (string) Str::ulid(),
                         'order_item_id' => $item->id,
                         'event_id' => $item->event_id,
-                        'ticket_type_id' =>
-                            $item->ticket_type_id,
+                        'ticket_type_id' => $item->ticket_type_id,
                         'token' => $rawToken,
-                        'token_hash' =>
-                            hash('sha256', $rawToken),
+                        'token_hash' => hash('sha256', $rawToken),
                         'admit_count' => max(
                             1,
                             (int) $item->people_per_unit
@@ -331,8 +300,7 @@ class PaymentFinalizer
     ): void {
         $payment->update([
             'status' => Payment::STATUS_REVIEW,
-            'provider_transaction_id' =>
-                isset($providerData['id'])
+            'provider_transaction_id' => isset($providerData['id'])
                     ? (string) $providerData['id']
                     : null,
             'channel' => $providerData['channel'] ?? null,
@@ -346,4 +314,3 @@ class PaymentFinalizer
         ]);
     }
 }
-

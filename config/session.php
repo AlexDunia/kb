@@ -32,7 +32,7 @@ return [
     'domain' => env('SESSION_DOMAIN'),
 
     // 🔧 PRODUCTION: Set to true (requires HTTPS)
-    'secure' => env('SESSION_SECURE_COOKIE', false),
+    'secure' => env('SESSION_SECURE_COOKIE', env('APP_ENV') === 'production'),
 
     'http_only' => true, // ✅ Always true for security
 

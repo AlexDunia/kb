@@ -8,6 +8,7 @@ use App\Services\Dashboard\DashboardAnalyticsService;
 use App\Services\Dashboard\EventAttributionService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Gate;
 
 class DashboardController extends Controller
 {
@@ -22,8 +23,7 @@ class DashboardController extends Controller
             ->orderBy('date')
             ->get()
             ->map(
-                fn (Event $event) =>
-                    $analytics->eventListItem($event)
+                fn (Event $event) => $analytics->eventListItem($event)
             )
             ->values();
 
@@ -37,7 +37,7 @@ class DashboardController extends Controller
         Event $event,
         DashboardAnalyticsService $analytics
     ): JsonResponse {
-        $this->authorizeOwner($request, $event);
+        Gate::authorize('update', $event);
 
         return response()->json([
             'data' => $analytics->overview($event),
@@ -49,7 +49,7 @@ class DashboardController extends Controller
         Event $event,
         DashboardAnalyticsService $analytics
     ): JsonResponse {
-        $this->authorizeOwner($request, $event);
+        Gate::authorize('update', $event);
 
         return response()->json([
             'data' => $analytics->shareLinks($event),
@@ -62,7 +62,7 @@ class DashboardController extends Controller
         EventAttributionService $attribution,
         DashboardAnalyticsService $analytics
     ): JsonResponse {
-        $this->authorizeOwner($request, $event);
+        Gate::authorize('update', $event);
 
         $validated = $request->validate([
             'label' => [
@@ -81,16 +81,5 @@ class DashboardController extends Controller
         return response()->json([
             'data' => $analytics->shareLinks($event),
         ], 201);
-    }
-
-    private function authorizeOwner(
-        Request $request,
-        Event $event
-    ): void {
-        abort_unless(
-            (int) $event->created_by === (int) $request->user()->id,
-            403,
-            'You do not have access to this event dashboard.'
-        );
     }
 }

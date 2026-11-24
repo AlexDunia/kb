@@ -28,20 +28,23 @@ class CreateEventTest extends TestCase
         $id = $created->json('data.id');
 
         $this->patchJson("/api/create-event/{$id}", [
+            'version' => 1,
+            'endsAtLocal' => '2026-08-01T21:00:00',
             'venue' => 'Eko Hotel',
             'format' => 'in-person',
             'startsAtLocal' => '2026-08-01T18:00:00',
             'timeZone' => 'Africa/Lagos',
         ])->assertOk()->assertJsonPath('data.title', 'Test');
 
-        $this->postJson("/api/create-event/{$id}/publish")
-            ->assertUnprocessable()->assertJsonPath('errors.coverImage', 'A cover image is required');
+        $this->postJson("/api/create-event/{$id}/publish", ['version' => 2])
+            ->assertUnprocessable()->assertJsonPath('errors.coverImage.0', 'A cover image is required');
 
         $this->patchJson("/api/create-event/{$id}", [
+            'version' => 2,
             'coverImage' => 'https://picsum.photos/800/450',
         ])->assertOk();
 
-        $this->postJson("/api/create-event/{$id}/publish")
+        $this->postJson("/api/create-event/{$id}/publish", ['version' => 3])
             ->assertOk()->assertJsonPath('data.status', 'active');
     }
 

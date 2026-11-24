@@ -19,8 +19,8 @@ Route::get(
     [\Laravel\Sanctum\Http\Controllers\CsrfCookieController::class, 'show']
 );
 
-Route::post('/login', [AuthController::class, 'login']);
-Route::post('/register', [AuthController::class, 'register']);
+Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:login');
+Route::post('/register', [AuthController::class, 'register'])->middleware('throttle:10,1');
 
 Route::post('/logout', [AuthController::class, 'logout'])
     ->middleware('auth:sanctum');
@@ -56,15 +56,15 @@ Route::get('/events', [EventController::class, 'index'])
 Route::get('/events/{event}', [EventController::class, 'show'])
     ->name('events.show');
 
-Route::post('/events', [EventController::class, 'store'])
+Route::post('/events', [EventController::class, 'retiredMutation'])
     ->middleware('auth:sanctum')
     ->name('events.store');
 
-Route::put('/events/{event}', [EventController::class, 'update'])
+Route::put('/events/{event}', [EventController::class, 'retiredMutation'])
     ->middleware('auth:sanctum')
     ->name('events.update');
 
-Route::delete('/events/{event}', [EventController::class, 'destroy'])
+Route::delete('/events/{event}', [EventController::class, 'retiredMutation'])
     ->middleware('auth:sanctum')
     ->name('events.destroy');
 
@@ -81,7 +81,7 @@ Route::get('/categories', [CategoryController::class, 'index'])
 Route::get(
     '/user/liked-events',
     [EventController::class, 'getLikedEvents']
-);
+)->middleware('auth:sanctum');
 
 Route::get('/subcategories', [SubCategoryController::class, 'index'])
     ->name('subcategories.index');
@@ -144,7 +144,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
     );
 });
 
-Route::middleware([
+Route::withoutMiddleware('throttle:api')->middleware([
     'auth:sanctum',
     'throttle:dashboard-read',
 ])->prefix('dashboard')->group(function () {
