@@ -3,6 +3,7 @@
 namespace App\Services\Commerce;
 
 use App\Models\Order;
+use App\Models\OrderItem;
 use App\Models\Payment;
 use App\Models\Ticket;
 use App\Models\TicketType;
@@ -12,305 +13,111 @@ use Illuminate\Support\Str;
 
 class PaymentFinalizer
 {
-    public function __construct(
-        private readonly InventoryService $inventory
-    ) {}
+    public function __construct(private readonly InventoryService $inventory) {}
 
-    public function finalizePaystack(
-        string $reference,
-        array $providerData
-    ): Order {
-        // Order lines are immutable after initialization. Read their IDs before the
-        // transaction, so its first consistent read happens after inventory row locks.
-        $inventoryIds = \App\Models\OrderItem::where('order_id', Payment::where('reference', $reference)->value('order_id'))
-            ->orderBy('ticket_type_id')->pluck('ticket_type_id')->unique()->values()->all();
+    public function finalizePaystack(string $reference, array $providerData): Order
+    {
+        $attempt = Payment::where('reference', $reference)->firstOrFail();
+        $inventoryIds = OrderItem::where('order_id', $attempt->order_id)->orderBy('ticket_type_id')->pluck('ticket_type_id')->unique()->all();
 
-        return DB::transaction(function () use (
-            $reference,
-            $providerData,
-            $inventoryIds
-        ) {
-            $payment = Payment::query()
-                ->where('reference', $reference)
-                ->lockForUpdate()
-                ->firstOrFail();
-
-            $order = Order::query()
-                ->whereKey($payment->order_id)
-                ->lockForUpdate()
-                ->firstOrFail();
-
-            if (
-                $payment->status === Payment::STATUS_SUCCESS
-                && $order->isPaid()
-            ) {
-                return $order->load(
-                    'items.tickets',
-                    'payments',
-                    'allocations'
-                );
+        return DB::transaction(function () use ($attempt, $inventoryIds, $providerData) {
+            // Existing-order operations always lock order, sorted inventory, then payments.
+            $order = Order::whereKey($attempt->order_id)->lockForUpdate()->firstOrFail();
+            $types = TicketType::whereIn('id', $inventoryIds)->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+            $payment = Payment::whereKey($attempt->id)->lockForUpdate()->firstOrFail();
+            if ($payment->status === Payment::STATUS_SUCCESS) {
+                return $order->load('items.tickets', 'payments', 'allocations');
             }
-
-            $providerStatus = strtolower(
-                (string) ($providerData['status'] ?? '')
-            );
-
-            if ($providerStatus !== 'success') {
-                if (
-                    in_array(
-                        $providerStatus,
-                        ['failed', 'abandoned', 'reversed'],
-                        true
-                    )
-                ) {
-                    $payment->update([
-                        'status' => Payment::STATUS_FAILED,
-                        'provider_transaction_id' => isset($providerData['id'])
-                                ? (string) $providerData['id']
-                                : null,
-                        'channel' => $providerData['channel'] ?? null,
-                        'gateway_response' => $providerData['gateway_response']
-                            ?? ucfirst($providerStatus),
-                        'paid_at' => $providerData['paid_at'] ?? null,
-                        'verified_at' => now(),
-                    ]);
-
-                    if (! $order->isPaid()) {
-                        $order->update([
-                            'status' => Order::STATUS_PAYMENT_FAILED,
-                        ]);
+            $status = strtolower((string) ($providerData['status'] ?? ''));
+            // Validate identity on every response, including failures. Do not coerce
+            // fractional/string-garbage amounts into a valid integer amount.
+            $amount = $providerData['amount'] ?? null;
+            $validAmount = (is_int($amount) || (is_string($amount) && ctype_digit($amount)))
+                && (string) $amount === (string) $payment->amount_minor;
+            $matches = ($providerData['reference'] ?? null) === $payment->reference
+                && $validAmount && strtoupper((string) ($providerData['currency'] ?? '')) === strtoupper($payment->currency);
+            if (! $matches) {
+                return $this->review($payment, $order, $providerData, 'verification_mismatch');
+            }
+            if ($status !== 'success') {
+                if (in_array($status, ['failed', 'abandoned', 'reversed'], true) && $payment->status !== Payment::STATUS_REVIEW) {
+                    $payment->update(['status' => Payment::STATUS_FAILED, 'verified_at' => now(), 'gateway_response' => $status]);
+                    $latestId = $order->payments()->orderByDesc('id')->value('id');
+                    if ((int) $latestId === (int) $payment->id && $order->status === Order::STATUS_PENDING_PAYMENT) {
+                        $order->update(['status' => Order::STATUS_PAYMENT_FAILED]);
                     }
                 }
 
-                return $order->fresh()->load(
-                    'items.tickets',
-                    'payments',
-                    'allocations'
-                );
+                return $order->fresh()->load('items.tickets', 'payments', 'allocations');
             }
-
-            $referenceMatches =
-                (string) ($providerData['reference'] ?? '')
-                === $payment->reference;
-
-            $amountMatches =
-                (int) ($providerData['amount'] ?? -1)
-                === (int) $payment->amount_minor;
-
-            $currencyMatches =
-                strtoupper(
-                    (string) ($providerData['currency'] ?? '')
-                )
-                === strtoupper((string) $payment->currency);
-
-            if (
-                ! $referenceMatches
-                || ! $amountMatches
-                || ! $currencyMatches
-            ) {
-                $payment->update([
-                    'status' => Payment::STATUS_REVIEW,
-                    'provider_transaction_id' => isset($providerData['id'])
-                            ? (string) $providerData['id']
-                            : null,
-                    'channel' => $providerData['channel'] ?? null,
-                    'gateway_response' => $providerData['gateway_response']
-                        ?? 'Verification mismatch',
-                    'paid_at' => $providerData['paid_at'] ?? null,
-                    'verified_at' => now(),
-                ]);
-
-                if (! $order->isPaid()) {
-                    $order->update([
-                        'status' => Order::STATUS_PAYMENT_REVIEW,
-                    ]);
-                }
-
-                return $order->fresh()->load(
-                    'items.tickets',
-                    'payments',
-                    'allocations'
-                );
+            if ($payment->status === Payment::STATUS_REVIEW) {
+                return $order->load('items.tickets', 'payments', 'allocations');
             }
-
-            /*
-             * A different successful payment for an order that is
-             * already paid must never issue another set of tickets.
-             * Keep the original order paid and flag only this extra
-             * payment for review.
-             */
+            if (in_array($order->status, [Order::STATUS_CANCELLED, Order::STATUS_REFUNDED, Order::STATUS_PAYMENT_REVIEW], true)) {
+                return $this->review($payment, $order, $providerData, 'terminal_order_charge');
+            }
             if ($order->isPaid()) {
-                $payment->update([
-                    'status' => Payment::STATUS_REVIEW,
-                    'provider_transaction_id' => isset($providerData['id'])
-                            ? (string) $providerData['id']
-                            : null,
-                    'channel' => $providerData['channel'] ?? null,
-                    'gateway_response' => $providerData['gateway_response']
-                        ?? 'Additional successful payment',
-                    'paid_at' => $providerData['paid_at'] ?? now(),
-                    'verified_at' => now(),
-                ]);
-
-                return $order->fresh()->load(
-                    'items.tickets',
-                    'payments',
-                    'allocations'
-                );
+                return $this->review($payment, $order, $providerData, 'additional_successful_payment');
             }
-
-            $ticketTypes = TicketType::query()->whereIn('id', $inventoryIds)->orderBy('id')->lockForUpdate()->get()->keyBy('id');
-            $ticketTypeIds = $inventoryIds;
+            $providerId = isset($providerData['id']) ? (string) $providerData['id'] : null;
+            if (! $providerId || strlen($providerId) > 40 || Payment::where('provider_transaction_id', $providerId)->where('id', '!=', $payment->id)->exists()) {
+                return $this->review($payment, $order, $providerData, 'duplicate_or_invalid_provider_transaction');
+            }
             $items = $order->items()->with('tickets')->orderBy('id')->get();
-
-            $paidAt = isset($providerData['paid_at'])
-                && $providerData['paid_at']
-                ? Carbon::parse($providerData['paid_at'])
-                : now();
-
-            $paidBeforeOrAtExpiry =
-                ! $order->expires_at
-                || $paidAt->lte($order->expires_at);
-
-            /*
-             * If Paystack says the customer actually paid before
-             * our reservation expired, honor that payment even if
-             * the webhook/browser verification reached us later.
-             *
-             * If the customer paid after expiry, the reservation no
-             * longer protects inventory. Re-check all lines while
-             * the ticket types are locked. If any line can no longer
-             * be fulfilled, put the payment/order into review and
-             * issue no tickets.
-             */
-            if (! $paidBeforeOrAtExpiry || ! $order->isReservationActive()) {
-                $reserved = $this->inventory
-                    ->reservedQuantities(
-                        $ticketTypeIds,
-                        $order->id
-                    );
-
-                foreach ($items as $item) {
-                    $ticketType = $ticketTypes->get(
-                        (int) $item->ticket_type_id
-                    );
-
-                    if (! $ticketType) {
-                        $this->moveToReview(
-                            $payment,
-                            $order,
-                            $providerData,
-                            $paidAt,
-                            'Ticket type no longer exists'
-                        );
-
-                        return $order->fresh()->load(
-                            'items.tickets',
-                            'payments',
-                            'allocations'
-                        );
-                    }
-
-                    $available = $this->inventory
-                        ->availableQuantity(
-                            (int) $ticketType->quantity,
-                            (int) (
-                                $reserved[
-                                    (int) $ticketType->id
-                                ] ?? 0
-                            )
-                        );
-
-                    if ((int) $item->quantity > $available) {
-                        $this->moveToReview(
-                            $payment,
-                            $order,
-                            $providerData,
-                            $paidAt,
-                            'Payment arrived after reservation expiry and inventory is no longer available'
-                        );
-
-                        return $order->fresh()->load(
-                            'items.tickets',
-                            'payments',
-                            'allocations'
-                        );
-                    }
+            // Always verify the entire commitment under inventory locks. Provider
+            // payment time cannot resurrect a hold that has already been released.
+            $committed = $this->inventory->reservedQuantities($inventoryIds, $order->id);
+            foreach ($items as $item) {
+                $type = $types->get($item->ticket_type_id);
+                if (! $type || $item->quantity > $this->inventory->availableQuantity($type->quantity, $committed[$item->ticket_type_id] ?? 0)) {
+                    return $this->review($payment, $order, $providerData, 'unfulfillable_charge');
                 }
             }
-
+            try {
+                $paidAt = ! empty($providerData['paid_at']) ? Carbon::parse($providerData['paid_at']) : now();
+            } catch (\Throwable) {
+                return $this->review($payment, $order, $providerData, 'invalid_payment_timestamp');
+            }
             $payment->update([
-                'status' => Payment::STATUS_SUCCESS,
-                'provider_transaction_id' => isset($providerData['id'])
-                        ? (string) $providerData['id']
-                        : null,
-                'channel' => $providerData['channel'] ?? null,
-                'gateway_response' => $providerData['gateway_response']
-                    ?? 'Success',
-                'paid_at' => $paidAt,
-                'verified_at' => now(),
+                'status' => Payment::STATUS_SUCCESS, 'provider_transaction_id' => $providerId,
+                'channel' => Str::limit((string) ($providerData['channel'] ?? ''), 50, ''),
+                'gateway_response' => 'Verified successful payment', 'paid_at' => $paidAt, 'verified_at' => now(),
             ]);
-
-            $order->update([
-                'status' => Order::STATUS_PAID,
-                'paid_at' => $paidAt,
-            ]);
-
+            $order->update(['status' => Order::STATUS_PAID, 'paid_at' => $paidAt]);
             foreach ($items as $item) {
-                $alreadyIssued = $item->tickets->count();
-
-                for (
-                    $index = $alreadyIssued;
-                    $index < (int) $item->quantity;
-                    $index++
-                ) {
-                    $rawToken = Str::random(48);
-
+                for ($index = $item->tickets->count(); $index < $item->quantity; $index++) {
+                    $token = Str::random(48);
                     Ticket::create([
-                        'public_id' => (string) Str::ulid(),
-                        'order_item_id' => $item->id,
-                        'event_id' => $item->event_id,
-                        'ticket_type_id' => $item->ticket_type_id,
-                        'token' => $rawToken,
-                        'token_hash' => hash('sha256', $rawToken),
-                        'admit_count' => max(
-                            1,
-                            (int) $item->people_per_unit
-                        ),
-                        'status' => 'valid',
-                        'issued_at' => now(),
+                        'public_id' => (string) Str::ulid(), 'order_item_id' => $item->id,
+                        'event_id' => $item->event_id, 'ticket_type_id' => $item->ticket_type_id,
+                        'token' => $token, 'token_hash' => hash('sha256', $token),
+                        'admit_count' => max(1, $item->people_per_unit), 'status' => 'valid', 'issued_at' => now(),
                     ]);
                 }
             }
+            DB::table('commerce_deliveries')->insertOrIgnore([
+                'order_id' => $order->id, 'deduplication_key' => 'purchase:'.$order->id,
+                'kind' => 'purchase', 'next_attempt_at' => now(), 'created_at' => now(), 'updated_at' => now(),
+            ]);
 
-            return $order->fresh()->load(
-                'items.tickets',
-                'payments',
-                'allocations'
-            );
+            // The durable outbox is drained by commerce:dispatch, even if a worker
+            // or web process crashes immediately after this commit.
+            return $order->fresh()->load('items.tickets', 'payments', 'allocations');
         }, 3);
     }
 
-    private function moveToReview(
-        Payment $payment,
-        Order $order,
-        array $providerData,
-        Carbon $paidAt,
-        string $reason
-    ): void {
-        $payment->update([
-            'status' => Payment::STATUS_REVIEW,
-            'provider_transaction_id' => isset($providerData['id'])
-                    ? (string) $providerData['id']
-                    : null,
-            'channel' => $providerData['channel'] ?? null,
-            'gateway_response' => $reason,
-            'paid_at' => $paidAt,
-            'verified_at' => now(),
+    private function review(Payment $payment, Order $order, array $data, string $reason): Order
+    {
+        DB::table('payment_resolutions')->insertOrIgnore([
+            'payment_id' => $payment->id, 'reason' => $reason,
+            'evidence' => json_encode(array_intersect_key($data, array_flip(['id', 'reference', 'amount', 'currency', 'status', 'paid_at'])), JSON_THROW_ON_ERROR),
+            'created_at' => now(), 'updated_at' => now(),
         ]);
+        $payment->update(['status' => Payment::STATUS_REVIEW, 'gateway_response' => $reason, 'verified_at' => now()]);
+        if (! in_array($order->status, [Order::STATUS_PAID, Order::STATUS_CANCELLED, Order::STATUS_REFUNDED], true)) {
+            $order->update(['status' => Order::STATUS_PAYMENT_REVIEW]);
+        }
 
-        $order->update([
-            'status' => Order::STATUS_PAYMENT_REVIEW,
-        ]);
+        return $order->fresh()->load('items.tickets', 'payments', 'allocations');
     }
 }

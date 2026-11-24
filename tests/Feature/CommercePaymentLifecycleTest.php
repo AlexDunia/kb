@@ -2,7 +2,6 @@
 
 namespace Tests\Feature;
 
-
 use App\Models\Order;
 use App\Models\Payment;
 use App\Models\User;
@@ -128,7 +127,7 @@ class CommercePaymentLifecycleTest extends TestCase
         [, $ticketTypeId] = $this->paidEvent($owner);
 
         $baselineTransactionLevel = DB::transactionLevel();
-$transactionLevel = null;
+        $transactionLevel = null;
 
         Http::fake(function (HttpRequest $request) use (&$transactionLevel) {
             $transactionLevel = DB::transactionLevel();
@@ -139,9 +138,8 @@ $transactionLevel = null;
                     'status' => true,
                     'message' => 'Authorization URL created',
                     'data' => [
-                        'authorization_url' =>
-                            'https://checkout.paystack.test/' . $reference,
-                        'access_code' => 'access_' . $reference,
+                        'authorization_url' => 'https://checkout.paystack.test/'.$reference,
+                        'access_code' => 'access_'.$reference,
                         'reference' => $reference,
                     ],
                 ],
@@ -740,9 +738,8 @@ $transactionLevel = null;
                     'status' => true,
                     'message' => 'Authorization URL created',
                     'data' => [
-                        'authorization_url' =>
-                            'https://checkout.paystack.test/' . $reference,
-                        'access_code' => 'access_' . $reference,
+                        'authorization_url' => 'https://checkout.paystack.test/'.$reference,
+                        'access_code' => 'access_'.$reference,
                         'reference' => $reference,
                     ],
                 ],
@@ -817,10 +814,9 @@ $transactionLevel = null;
         $this->assertDatabaseHas(
             'orders',
             [
-                'public_id' =>
-                    $initialize->json(
-                        'data.order.public_id'
-                    ),
+                'public_id' => $initialize->json(
+                    'data.order.public_id'
+                ),
                 'status' => Order::STATUS_EXPIRED,
             ]
         );
@@ -923,7 +919,7 @@ $transactionLevel = null;
             )
             ->firstOrFail();
 
-        $secondReference = 'KT-' . Str::ulid();
+        $secondReference = 'KT-'.Str::ulid();
 
         Payment::create([
             'order_id' => $order->id,
@@ -945,10 +941,10 @@ $transactionLevel = null;
         )->postJson(
             "/api/checkout/payments/{$secondReference}/verify"
         )->assertOk()
-         ->assertJsonPath(
-             'data.status',
-             Order::STATUS_PAID
-         );
+            ->assertJsonPath(
+                'data.status',
+                Order::STATUS_PAID
+            );
 
         $this->assertDatabaseCount('tickets', 1);
 
@@ -959,6 +955,179 @@ $transactionLevel = null;
                 'status' => Payment::STATUS_REVIEW,
             ]
         );
+    }
+
+    public function test_old_failed_attempt_cannot_release_new_reservation(): void
+    {
+        [, $type] = $this->paidEvent(User::factory()->create());
+        $this->fakeInitialize();
+        $payload = $this->checkoutPayload($type, (string) Str::uuid());
+        $first = app(\App\Services\Commerce\CheckoutService::class)->initialize($payload, null);
+        $reference = $first['payment']['reference'];
+        $data = ['reference' => $reference, 'amount' => 100000, 'currency' => 'NGN', 'status' => 'failed'];
+        $finalizer = app(\App\Services\Commerce\PaymentFinalizer::class);
+        $finalizer->finalizePaystack($reference, $data);
+        $retry = app(\App\Services\Commerce\CheckoutService::class)->initialize($payload, null);
+        $this->assertNotSame($reference, $retry['payment']['reference']);
+        $this->assertSame('pending_payment', $finalizer->finalizePaystack($reference, $data)->status);
+        $this->assertSame(1, app(\App\Services\Commerce\InventoryService::class)->reservedQuantities([$type])[$type]);
+    }
+
+    public function test_cancelled_and_refunded_orders_are_never_revived(): void
+    {
+        foreach (['cancelled', 'refunded'] as $status) {
+            [, $type] = $this->paidEvent(User::factory()->create());
+            $this->fakeInitialize();
+            $result = app(\App\Services\Commerce\CheckoutService::class)->initialize($this->checkoutPayload($type, (string) Str::uuid()), null);
+            $order = Order::where('public_id', $result['order']['public_id'])->firstOrFail();
+            $order->update(['status' => $status]);
+            $reference = $result['payment']['reference'];
+            $final = app(\App\Services\Commerce\PaymentFinalizer::class)->finalizePaystack($reference, [
+                'id' => random_int(10000, 999999), 'reference' => $reference, 'amount' => 100000, 'currency' => 'NGN', 'status' => 'success',
+            ]);
+            $this->assertSame($status, $final->status);
+            $this->assertDatabaseHas('payment_resolutions', ['payment_id' => Payment::where('reference', $reference)->value('id'), 'reason' => 'terminal_order_charge']);
+        }
+        $this->assertDatabaseCount('tickets', 0);
+    }
+
+    public function test_initialization_response_cannot_overwrite_successful_finalization(): void
+    {
+        [, $type] = $this->paidEvent(User::factory()->create());
+        Http::fake(function ($request) {
+            $this->assertSame(1, DB::transactionLevel());
+            $reference = $request['reference'];
+            app(\App\Services\Commerce\PaymentFinalizer::class)->finalizePaystack($reference, [
+                'id' => 99123, 'reference' => $reference, 'amount' => 100000, 'currency' => 'NGN', 'status' => 'success',
+            ]);
+
+            return Http::response(['status' => true, 'data' => ['reference' => $reference, 'access_code' => 'access', 'authorization_url' => 'https://example.com/pay']]);
+        });
+        $result = app(\App\Services\Commerce\CheckoutService::class)->initialize($this->checkoutPayload($type, (string) Str::uuid()), null);
+        $this->assertSame('paid', $result['order']['status']);
+        $this->assertSame('success', $result['payment']['status']);
+        $this->assertDatabaseCount('tickets', 1);
+        $this->assertDatabaseCount('commerce_deliveries', 1);
+    }
+
+    public function test_provider_failure_preserves_ambiguous_attempt_for_reconciliation(): void
+    {
+        [, $type] = $this->paidEvent(User::factory()->create());
+        Http::fake(fn () => Http::response(['status' => false], 503));
+        try {
+            app(\App\Services\Commerce\CheckoutService::class)->initialize($this->checkoutPayload($type, (string) Str::uuid()), null);
+            $this->fail('Provider failure should propagate');
+        } catch (\RuntimeException $exception) {
+            $this->assertSame('pending_payment', Order::firstOrFail()->status);
+            $this->assertSame('created', Payment::firstOrFail()->status);
+            $this->assertDatabaseCount('payment_reconciliations', 1);
+        }
+    }
+
+    public function test_scheduler_reconciles_missed_notification_without_inventory_network_locks(): void
+    {
+        [, $type] = $this->paidEvent(User::factory()->create());
+        $this->fakeInitialize();
+        $result = app(\App\Services\Commerce\CheckoutService::class)->initialize($this->checkoutPayload($type, (string) Str::uuid()), null);
+        $reference = $result['payment']['reference'];
+        $this->fakeVerify($reference, 100000);
+        DB::table('payment_reconciliations')->update(['next_attempt_at' => now()->subMinute()]);
+        (new \App\Jobs\ReconcilePayment(Payment::firstOrFail()->id))->handle(app(\App\Services\Commerce\PaystackService::class), app(\App\Services\Commerce\PaymentFinalizer::class));
+        $this->assertSame('paid', Order::firstOrFail()->status);
+        $this->assertNotNull(DB::table('payment_reconciliations')->first()->finished_at);
+        $this->assertDatabaseCount('commerce_deliveries', 1);
+    }
+
+    public function test_recovery_is_verified_single_use_scoped_and_expiring(): void
+    {
+        [, $type] = $this->paidEvent(User::factory()->create());
+        $this->fakeInitialize();
+        $result = app(\App\Services\Commerce\CheckoutService::class)->initialize($this->checkoutPayload($type, (string) Str::uuid()), null);
+        $order = Order::firstOrFail();
+        $this->postJson('/api/checkout/recovery/request', ['order_public_id' => $order->public_id, 'email' => 'wrong@example.com'])->assertStatus(202);
+        $this->assertDatabaseCount('commerce_deliveries', 0);
+        $this->postJson('/api/checkout/recovery/request', ['order_public_id' => $order->public_id, 'email' => $order->customer_email])->assertStatus(202);
+        $this->assertDatabaseCount('commerce_deliveries', 1);
+        $token = app(\App\Services\Commerce\OrderRecoveryService::class)->create($order);
+        $access = $this->postJson('/api/checkout/recovery/exchange', ['token' => $token])->assertOk()->json('data.access_token');
+        $this->postJson('/api/checkout/recovery/exchange', ['token' => $token])->assertForbidden();
+        $this->withHeader('X-Order-Recovery-Token', $access)->getJson('/api/checkout/orders/'.$order->public_id)->assertOk();
+        $this->travel(31)->minutes();
+        $this->getJson('/api/checkout/orders/'.$order->public_id)->assertForbidden();
+    }
+
+    public function test_buyer_history_and_ticket_credentials_are_owner_only(): void
+    {
+        $buyer = User::factory()->create();
+        [, $type] = $this->paidEvent(User::factory()->create());
+        $this->fakeInitialize();
+        $result = app(\App\Services\Commerce\CheckoutService::class)->initialize($this->checkoutPayload($type, (string) Str::uuid()), $buyer->id);
+        $reference = $result['payment']['reference'];
+        app(\App\Services\Commerce\PaymentFinalizer::class)->finalizePaystack($reference, ['id' => 5599, 'reference' => $reference, 'amount' => 100000, 'currency' => 'NGN', 'status' => 'success']);
+        $ticket = \App\Models\Ticket::firstOrFail();
+        $this->getJson('/api/buyer/orders')->assertUnauthorized();
+        $this->actingAs(User::factory()->create())->getJson('/api/buyer/orders')->assertOk()->assertJsonCount(0, 'data');
+        $this->getJson('/api/buyer/tickets/'.$ticket->public_id)->assertForbidden();
+        $this->actingAs($buyer)->getJson('/api/buyer/orders')->assertOk()->assertJsonPath('data.0.items.0.tickets.0.token', $ticket->token);
+        $this->getJson('/api/buyer/tickets/'.$ticket->public_id)->assertOk()->assertJsonPath('data.token', $ticket->token);
+    }
+
+    public function test_delivery_failure_is_durable_and_retry_sends_only_once_after_success(): void
+    {
+        [, $type] = $this->paidEvent(User::factory()->create());
+        $this->fakeInitialize();
+        $result = app(\App\Services\Commerce\CheckoutService::class)->initialize($this->checkoutPayload($type, (string) Str::uuid()), null);
+        $reference = $result['payment']['reference'];
+        app(\App\Services\Commerce\PaymentFinalizer::class)->finalizePaystack($reference, ['id' => 114499, 'reference' => $reference, 'amount' => 100000, 'currency' => 'NGN', 'status' => 'success']);
+        $delivery = DB::table('commerce_deliveries')->first();
+        \Illuminate\Support\Facades\Mail::shouldReceive('raw')->once()->andThrow(new \RuntimeException('Transport unavailable'));
+        try {
+            (new \App\Jobs\DeliverOrder($delivery->id))->handle(app(\App\Services\Commerce\OrderRecoveryService::class));
+            $this->fail('Transport failure should propagate');
+        } catch (\RuntimeException $exception) {
+            $failed = DB::table('commerce_deliveries')->first();
+            $this->assertNull($failed->sent_at);
+            $this->assertNotNull($failed->last_error);
+            $this->assertSame(1, $failed->attempts);
+            $this->assertNotNull($failed->recovery_token);
+        }
+        \Illuminate\Support\Facades\Mail::fake();
+        $this->travel(6)->minutes();
+        $job = new \App\Jobs\DeliverOrder($delivery->id);
+        $job->handle(app(\App\Services\Commerce\OrderRecoveryService::class));
+        $job->handle(app(\App\Services\Commerce\OrderRecoveryService::class));
+        $sent = DB::table('commerce_deliveries')->first();
+        $this->assertNotNull($sent->sent_at);
+        $this->assertNull($sent->recovery_token);
+        $this->assertSame(2, $sent->attempts);
+    }
+
+    public function test_early_provider_payment_time_cannot_restore_released_stock(): void
+    {
+        [, $type] = $this->paidEvent(User::factory()->create(), capacity: 1);
+        $this->fakeInitialize();
+        $checkout = app(\App\Services\Commerce\CheckoutService::class);
+        $first = $checkout->initialize($this->checkoutPayload($type, (string) Str::uuid()), null);
+        $reference = $first['payment']['reference'];
+        $finalizer = app(\App\Services\Commerce\PaymentFinalizer::class);
+        $finalizer->finalizePaystack($reference, ['reference' => $reference, 'amount' => 100000, 'currency' => 'NGN', 'status' => 'failed']);
+        $checkout->initialize($this->checkoutPayload($type, (string) Str::uuid()), null);
+        $result = $finalizer->finalizePaystack($reference, ['id' => 88117, 'reference' => $reference, 'amount' => 100000, 'currency' => 'NGN', 'status' => 'success', 'paid_at' => now()->subMinute()->toIso8601String()]);
+        $this->assertSame('payment_review', $result->status);
+        $this->assertDatabaseHas('payment_resolutions', ['reason' => 'unfulfillable_charge']);
+        $this->assertDatabaseCount('tickets', 0);
+        $this->assertSame(1, app(\App\Services\Commerce\InventoryService::class)->reservedQuantities([$type])[$type]);
+    }
+
+    public function test_fractional_provider_amount_is_not_accepted_by_integer_coercion(): void
+    {
+        [, $type] = $this->paidEvent(User::factory()->create());
+        $this->fakeInitialize();
+        $first = app(\App\Services\Commerce\CheckoutService::class)->initialize($this->checkoutPayload($type, (string) Str::uuid()), null);
+        $reference = $first['payment']['reference'];
+        $order = app(\App\Services\Commerce\PaymentFinalizer::class)->finalizePaystack($reference, ['id' => 88118, 'reference' => $reference, 'amount' => 100000.99, 'currency' => 'NGN', 'status' => 'success']);
+        $this->assertSame('payment_review', $order->status);
+        $this->assertDatabaseCount('tickets', 0);
     }
 
     private function checkoutPayload(
@@ -1001,14 +1170,11 @@ $transactionLevel = null;
                 return Http::response(
                     [
                         'status' => true,
-                        'message' =>
-                            'Authorization URL created',
+                        'message' => 'Authorization URL created',
                         'data' => [
-                            'authorization_url' =>
-                                'https://checkout.paystack.test/'
-                                . $reference,
-                            'access_code' =>
-                                'access_' . $reference,
+                            'authorization_url' => 'https://checkout.paystack.test/'
+                                .$reference,
+                            'access_code' => 'access_'.$reference,
                             'reference' => $reference,
                         ],
                     ],
@@ -1044,9 +1210,8 @@ $transactionLevel = null;
                         'status' => true,
                         'message' => 'Verification complete',
                         'data' => [
-                            'id' =>
-                                'txn_'
-                                . substr(
+                            'id' => 'txn_'
+                                .substr(
                                     hash(
                                         'sha256',
                                         $reference
@@ -1059,12 +1224,10 @@ $transactionLevel = null;
                             'amount' => $stub['amount_minor'],
                             'currency' => $stub['currency'],
                             'channel' => 'card',
-                            'gateway_response' =>
-                                ucfirst(
-                                    $stub['status']
-                                ),
-                            'paid_at' =>
-                                $stub['paid_at']
+                            'gateway_response' => ucfirst(
+                                $stub['status']
+                            ),
+                            'paid_at' => $stub['paid_at']
                                 ?? now()->toIso8601String(),
                         ],
                     ],
@@ -1117,7 +1280,7 @@ $transactionLevel = null;
         $categoryId = DB::table(
             'categories'
         )->insertGetId([
-            'name' => 'Category ' . Str::ulid(),
+            'name' => 'Category '.Str::ulid(),
             'created_at' => now(),
             'updated_at' => now(),
         ]);
@@ -1125,7 +1288,7 @@ $transactionLevel = null;
         $organizerId = DB::table(
             'organizers'
         )->insertGetId([
-            'name' => 'Organizer ' . Str::ulid(),
+            'name' => 'Organizer '.Str::ulid(),
             'email' => null,
             'created_at' => now(),
             'updated_at' => now(),

@@ -142,4 +142,91 @@ class EventConcurrencyTest extends TestCase
         $this->assertDatabaseCount('orders', 0);
         $this->assertSame(0, $event->ticketTypes()->first()->quantity);
     }
+
+    public function test_simultaneous_purchases_serialize_on_the_last_unit(): void
+    {
+        $owner = User::factory()->create();
+        $event = $this->lifecycleEvent($owner, true);
+        $type = $event->ticketTypes()->first();
+        $type->update(['quantity' => 1]);
+        $payload = ['checkout_token' => (string) Str::uuid(), 'customer' => ['first_name' => 'Ada', 'last_name' => 'Buyer', 'email' => 'buyer@example.com', 'phone' => '08000000000'], 'items' => [['ticket_type_id' => $type->id, 'quantity' => 1]]];
+        DB::beginTransaction();
+        try {
+            DB::table('ticket_types')->where('id', $type->id)->lockForUpdate()->first();
+            $first = $this->worker('checkout', $owner->id, $event->id, $payload);
+            $payload['checkout_token'] = (string) Str::uuid();
+            $second = $this->worker('checkout', $owner->id, $event->id, $payload);
+            $this->waitUntilReady($first);
+            $this->waitUntilReady($second);
+            DB::commit();
+        } finally {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+        }
+        $statuses = [$this->workerResult($first)['status'], $this->workerResult($second)['status']];
+        sort($statuses);
+        $this->assertSame([201, 422], $statuses);
+        $this->assertDatabaseCount('orders', 1);
+    }
+
+    public function test_simultaneous_finalizers_issue_only_one_ticket(): void
+    {
+        $owner = User::factory()->create();
+        $event = $this->lifecycleEvent($owner, true);
+        $order = $this->lifecycleOrder($event, units: 1);
+        $payment = \App\Models\Payment::create(['order_id' => $order->id, 'provider' => 'paystack', 'reference' => 'KT-'.Str::ulid(), 'amount_minor' => $order->total_minor, 'currency' => 'NGN', 'status' => 'initialized']);
+        $payload = ['id' => 71199, 'reference' => $payment->reference, 'amount' => $payment->amount_minor, 'currency' => 'NGN', 'status' => 'success'];
+        DB::beginTransaction();
+        try {
+            DB::table('orders')->where('id', $order->id)->lockForUpdate()->first();
+            $first = $this->worker('finalize', $owner->id, $event->id, $payload);
+            $second = $this->worker('finalize', $owner->id, $event->id, $payload);
+            $this->waitUntilReady($first);
+            $this->waitUntilReady($second);
+            DB::commit();
+        } finally {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+        }
+        $this->assertSame(200, $this->workerResult($first)['status']);
+        $this->assertSame(200, $this->workerResult($second)['status']);
+        $this->assertDatabaseCount('tickets', 1);
+        $this->assertDatabaseCount('commerce_deliveries', 1);
+        $this->assertSame('paid', $order->fresh()->status);
+    }
+
+    public function test_failed_retry_and_new_purchase_compete_for_the_same_released_unit(): void
+    {
+        $owner = User::factory()->create();
+        $event = $this->lifecycleEvent($owner, true);
+        $type = $event->ticketTypes()->first();
+        $type->update(['quantity' => 1]);
+        $order = $this->lifecycleOrder($event, status: 'payment_failed', units: 1);
+        $customer = ['first_name' => 'Ada', 'last_name' => 'Buyer', 'email' => 'retry@example.com', 'phone' => '08000000000'];
+        $items = [['ticket_type_id' => $type->id, 'quantity' => 1]];
+        $token = (string) Str::uuid();
+        $order->update(['checkout_token_hash' => hash('sha256', $token), 'cart_fingerprint' => hash('sha256', json_encode(['customer' => $customer, 'items' => $items], JSON_THROW_ON_ERROR))]);
+        \App\Models\Payment::create(['order_id' => $order->id, 'provider' => 'paystack', 'reference' => 'KT-'.Str::ulid(), 'amount_minor' => $order->total_minor, 'currency' => 'NGN', 'status' => 'failed']);
+        $payload = ['checkout_token' => $token, 'customer' => $customer, 'items' => $items];
+        DB::beginTransaction();
+        try {
+            DB::table('ticket_types')->where('id', $type->id)->lockForUpdate()->first();
+            $retry = $this->worker('checkout', $owner->id, $event->id, $payload);
+            $payload['checkout_token'] = (string) Str::uuid();
+            $purchase = $this->worker('checkout', $owner->id, $event->id, $payload);
+            $this->waitUntilReady($retry);
+            $this->waitUntilReady($purchase);
+            DB::commit();
+        } finally {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+        }
+        $statuses = [$this->workerResult($retry)['status'], $this->workerResult($purchase)['status']];
+        sort($statuses);
+        $this->assertSame([201, 422], $statuses);
+        $this->assertSame(1, app(\App\Services\Commerce\InventoryService::class)->reservedQuantities([$type->id])[$type->id]);
+    }
 }

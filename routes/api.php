@@ -19,8 +19,8 @@ Route::get(
     [\Laravel\Sanctum\Http\Controllers\CsrfCookieController::class, 'show']
 );
 
-Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:login');
-Route::post('/register', [AuthController::class, 'register'])->middleware('throttle:10,1');
+Route::post('/login', [AuthController::class, 'login']);
+Route::post('/register', [AuthController::class, 'register']);
 
 Route::post('/logout', [AuthController::class, 'logout'])
     ->middleware('auth:sanctum');
@@ -200,3 +200,8 @@ Route::post(
 )
     ->withoutMiddleware('throttle:api')
     ->middleware('throttle:paystack-webhook');
+
+Route::get('/buyer/orders', [\App\Http\Controllers\Api\BuyerOrderController::class, 'index'])->middleware('auth:sanctum');
+Route::get('/buyer/tickets/{publicId}', [\App\Http\Controllers\Api\BuyerOrderController::class, 'ticket']);
+Route::post('/checkout/recovery/request', [\App\Http\Controllers\Api\BuyerOrderController::class, 'requestRecovery'])->middleware('throttle:5,10');
+Route::post('/checkout/recovery/exchange', [\App\Http\Controllers\Api\BuyerOrderController::class, 'exchangeRecovery'])->middleware('throttle:10,10');

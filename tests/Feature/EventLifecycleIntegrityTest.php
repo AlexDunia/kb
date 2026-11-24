@@ -250,6 +250,13 @@ class EventLifecycleIntegrityTest extends TestCase
         \Illuminate\Support\Facades\Http::fake(['*' => \Illuminate\Support\Facades\Http::response(['status' => false], 500)]);
         $payload = ['checkout_token' => (string) \Illuminate\Support\Str::uuid(), 'customer' => ['first_name' => 'Ada', 'last_name' => 'Buyer', 'email' => 'retry@example.com', 'phone' => '+2348000000000'], 'items' => [['ticket_type_id' => $type->id, 'quantity' => 1]]];
         $this->postJson('/api/checkout/initialize', $payload)->assertStatus(500);
+        $this->assertDatabaseHas('orders', ['status' => Order::STATUS_PENDING_PAYMENT]);
+        // A network/provider failure is ambiguous. Only a verified failed attempt
+        // releases inventory; the same capacity-reacquisition guard still applies.
+        $payment = \App\Models\Payment::firstOrFail();
+        app(\App\Services\Commerce\PaymentFinalizer::class)->finalizePaystack($payment->reference, [
+            'reference' => $payment->reference, 'amount' => $payment->amount_minor, 'currency' => $payment->currency, 'status' => 'failed',
+        ]);
         $this->assertDatabaseHas('orders', ['status' => Order::STATUS_PAYMENT_FAILED]);
         $this->actingAs($owner)->patchJson("/api/create-event/{$event->id}", ['version' => 2, 'tickets' => [['id' => $type->id, 'units' => 0]]])->assertOk();
         $this->postJson('/api/checkout/initialize', $payload)->assertUnprocessable();

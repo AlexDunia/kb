@@ -14,6 +14,9 @@ try {
     if ($action === 'edit') {
         $event = app(App\Services\CreateEventService::class)->saveEvent($payload, (int) $ownerId, (int) $eventId);
         $result = ['status' => 200, 'version' => $event->lock_version];
+    } elseif ($action === 'finalize') {
+        app(App\Services\Commerce\PaymentFinalizer::class)->finalizePaystack($payload['reference'], $payload);
+        $result = ['status' => 200];
     } else {
         config(['services.paystack.secret_key' => 'test-key', 'services.paystack.base_url' => 'https://api.paystack.co']);
         Illuminate\Support\Facades\Http::fake(fn ($request) => Illuminate\Support\Facades\Http::response(['status' => true, 'data' => ['reference' => $request['reference'], 'access_code' => 'fake', 'authorization_url' => 'https://example.com/pay']]));

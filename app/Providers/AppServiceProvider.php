@@ -39,8 +39,6 @@ class AppServiceProvider extends ServiceProvider
             }
         );
 
-        RateLimiter::for('login', fn (Request $request) => Limit::perMinute(10)->by(Str::lower((string) $request->input('email')).'|'.$request->ip()));
-
         RateLimiter::for(
             'api',
             fn (Request $request) => Limit::perMinute(60)->by(

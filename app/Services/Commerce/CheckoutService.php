@@ -256,6 +256,13 @@ class CheckoutService
             return;
         }
 
+        $recoveryToken = request()->header('X-Order-Recovery-Token');
+        if (is_string($recoveryToken) && $recoveryToken !== '' && DB::table('order_recoveries')
+            ->where('order_id', $order->id)->where('access_hash', hash('sha256', $recoveryToken))
+            ->whereNotNull('exchanged_at')->where('expires_at', '>', now())->exists()) {
+            return;
+        }
+
         abort(403, 'You do not have access to this order.');
     }
 
@@ -272,6 +279,7 @@ class CheckoutService
             'total_minor' => (int) $order->total_minor,
             'expires_at' => $order->expires_at?->toIso8601String(),
             'paid_at' => $order->paid_at?->toIso8601String(),
+            'created_at' => $order->created_at?->toIso8601String(),
             'items' => $order->items
                 ->map(
                     fn (OrderItem $item) => [
@@ -324,92 +332,39 @@ class CheckoutService
 
     private function continueExistingOrder(Order $order): array
     {
-        $order->refresh();
-
-        if (
-            in_array(
-                $order->status,
-                [
-                    Order::STATUS_PAID,
-                    Order::STATUS_PAYMENT_REVIEW,
-                    Order::STATUS_CANCELLED,
-                    Order::STATUS_REFUNDED,
-                ],
-                true
-            )
-        ) {
-            return $this->payload(
-                $order,
-                $order->payments()
-                    ->latest('id')
-                    ->first()
-            );
-        }
-
-        if (
-            $order->expires_at
-            && $order->expires_at->isPast()
-        ) {
-            $order->update([
-                'status' => Order::STATUS_EXPIRED,
-            ]);
-
-            throw ValidationException::withMessages([
-                'checkout_token' => [
-                    'This checkout reservation has expired. Start a new checkout attempt.',
-                ],
-            ]);
-        }
-
-        $payment = $order->payments()
-            ->latest('id')
-            ->first();
-
-        if ($order->status === Order::STATUS_PAYMENT_FAILED) {
-            $items = $order->items()->orderBy('ticket_type_id')->get(['ticket_type_id', 'quantity'])->toArray();
-            $order = DB::transaction(function () use ($order, $items) {
-                $locked = Order::whereKey($order->id)->lockForUpdate()->firstOrFail();
-                $ids = array_column($items, 'ticket_type_id');
-                $types = TicketType::whereIn('id', $ids)->orderBy('id')->lockForUpdate()->get()->keyBy('id');
-                if ($locked->status === Order::STATUS_PAYMENT_FAILED) {
-                    $types->load('event');
-                    $this->buildQuote($items, $types, $this->inventory->reservedQuantities($ids, $locked->id));
-                    $locked->update(['status' => Order::STATUS_PENDING_PAYMENT]);
-                }
-
-                return $locked;
-            }, 3);
-            if ($order->status !== Order::STATUS_PENDING_PAYMENT) {
-                return $this->payload($order, $order->payments()->latest('id')->first());
+        $items = $order->items()->orderBy('ticket_type_id')->get(['ticket_type_id', 'quantity'])->toArray();
+        [$order, $payment, $expired] = DB::transaction(function () use ($order, $items) {
+            $locked = Order::whereKey($order->id)->lockForUpdate()->firstOrFail();
+            $ids = array_column($items, 'ticket_type_id');
+            $types = TicketType::whereIn('id', $ids)->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+            $payment = $locked->payments()->latest('id')->lockForUpdate()->first();
+            if (in_array($locked->status, [Order::STATUS_PAID, Order::STATUS_PAYMENT_REVIEW, Order::STATUS_CANCELLED, Order::STATUS_REFUNDED], true)) {
+                return [$locked, $payment, false];
             }
-        }
+            if ($locked->expires_at?->lte(now())) {
+                $locked->update(['status' => Order::STATUS_EXPIRED]);
 
-        if (
-            $payment
-            && $payment->status === Payment::STATUS_INITIALIZED
-            && $payment->access_code
-        ) {
+                return [$locked, $payment, true];
+            }
+            if ($locked->status === Order::STATUS_PAYMENT_FAILED) {
+                $types->load('event');
+                $this->buildQuote($items, $types, $this->inventory->reservedQuantities($ids, $locked->id));
+                $locked->update(['status' => Order::STATUS_PENDING_PAYMENT]);
+            }
+            if (! $payment || $payment->status === Payment::STATUS_FAILED) {
+                $payment = $this->createPayment($locked);
+            }
+
+            return [$locked, $payment, false];
+        }, 3);
+        if ($expired) {
+            throw ValidationException::withMessages(['checkout_token' => ['This checkout reservation has expired. Start a new checkout attempt.']]);
+        }
+        if ($order->status !== Order::STATUS_PENDING_PAYMENT || $payment?->access_code || $payment?->gateway_response === 'Provider initialization unresolved; verification required') {
             return $this->payload($order, $payment);
         }
 
-        if (
-            ! $payment
-            || in_array(
-                $payment->status,
-                [
-                    Payment::STATUS_FAILED,
-                    Payment::STATUS_REVIEW,
-                ],
-                true
-            )
-        ) {
-            $payment = $this->createPayment($order);
-        }
-
-        return $this->initializePayment(
-            $order,
-            $payment
-        );
+        return $this->initializePayment($order, $payment);
     }
 
     private function initializePayment(
@@ -422,7 +377,7 @@ class CheckoutService
                 $payment
             );
 
-            $payment->update([
+            Payment::whereKey($payment->id)->where('status', Payment::STATUS_CREATED)->update([
                 'status' => Payment::STATUS_INITIALIZED,
                 'access_code' => $result['access_code'],
                 'authorization_url' => $result['authorization_url'],
@@ -439,18 +394,14 @@ class CheckoutService
                 $payment->fresh()
             );
         } catch (Throwable $exception) {
-            $payment->update([
-                'status' => Payment::STATUS_FAILED,
-                'gateway_response' => Str::limit(
-                    $exception->getMessage(),
-                    255,
-                    ''
-                ),
-            ]);
-
-            $order->update([
-                'status' => Order::STATUS_PAYMENT_FAILED,
-            ]);
+            DB::transaction(function () use ($order, $payment) {
+                $locked = Order::whereKey($order->id)->lockForUpdate()->firstOrFail();
+                // Network timeouts are ambiguous: retain the reservation and reconcile
+                // this same reference rather than opening another payable attempt.
+                Payment::whereKey($payment->id)->where('status', Payment::STATUS_CREATED)->update([
+                    'gateway_response' => 'Provider initialization unresolved; verification required',
+                ]);
+            }, 3);
 
             throw $exception;
         }
@@ -458,7 +409,7 @@ class CheckoutService
 
     private function createPayment(Order $order): Payment
     {
-        return Payment::query()->create([
+        $payment = Payment::query()->create([
             'order_id' => $order->id,
             'provider' => 'paystack',
             'reference' => 'KT-'.Str::ulid(),
@@ -466,6 +417,9 @@ class CheckoutService
             'currency' => $order->currency,
             'status' => Payment::STATUS_CREATED,
         ]);
+        DB::table('payment_reconciliations')->insert(['payment_id' => $payment->id, 'next_attempt_at' => now()->addMinutes(2), 'created_at' => now(), 'updated_at' => now()]);
+
+        return $payment;
     }
 
     private function createAllocations(
